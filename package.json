@@ -1,0 +1,108 @@
+{
+  "name": "coding-llama",
+  "displayName": "CodingLlama",
+  "description": "A local AI coding assistant powered by Ollama models",
+  "version": "0.1.0",
+  "publisher": "coding-llama",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "AI",
+    "Chat"
+  ],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "codingLlama",
+          "title": "CodingLlama",
+          "icon": "media/icon.svg"
+        }
+      ]
+    },
+    "views": {
+      "codingLlama": [
+        {
+          "type": "webview",
+          "id": "codingLlama.chatView",
+          "name": "Chat",
+          "icon": "media/icon.svg"
+        }
+      ]
+    },
+    "commands": [
+      {
+        "command": "codingLlama.newChat",
+        "title": "New Chat",
+        "icon": "$(add)"
+      },
+      {
+        "command": "codingLlama.clearChats",
+        "title": "Clear All Sessions"
+      },
+      {
+        "command": "codingLlama.addFile",
+        "title": "Add to CodingLlama Chat"
+      }
+    ],
+    "menus": {
+      "view/title": [
+        {
+          "command": "codingLlama.newChat",
+          "when": "view == codingLlama.chatView",
+          "group": "navigation"
+        }
+      ],
+      "explorer/context": [
+        {
+          "command": "codingLlama.addFile",
+          "group": "codingLlama"
+        }
+      ],
+      "editor/title/context": [
+        {
+          "command": "codingLlama.addFile",
+          "group": "codingLlama"
+        }
+      ],
+      "editor/context": [
+        {
+          "command": "codingLlama.addFile",
+          "group": "codingLlama"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "CodingLlama",
+      "properties": {
+        "codingLlama.baseUrl": {
+          "type": "string",
+          "default": "http://localhost:11434",
+          "description": "Ollama server base URL"
+        },
+        "codingLlama.model": {
+          "type": "string",
+          "default": "qwen2.5-coder:7b",
+          "description": "Active Ollama model for chat completions"
+        }
+      }
+    }
+  },
+  "scripts": {
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "@types/vscode": "^1.85.0",
+    "typescript": "^5.3.0"
+  },
+  "dependencies": {
+    "marked": "^17.0.6"
+  }
+}

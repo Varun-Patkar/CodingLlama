@@ -1,0 +1,1016 @@
+/* =========================================================================
+ * CodingLlama — Webview Styles
+ *
+ * Copilot-style layout:
+ *  - Sessions bar at top (horizontal, collapsible)
+ *  - Chat messages area (scrollable, flex grow)
+ *  - Self-contained input box at bottom with mode + model dropups inside
+ *
+ * Uses VS Code CSS variables for automatic theme adaptation.
+ * ========================================================================= */
+
+/* ── Reset & base ──────────────────────────────────────────────────────── */
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+html, body {
+  height: 100%;
+  overflow: hidden;
+  background: var(--vscode-sideBar-background);
+  color: var(--vscode-foreground);
+  font-family: var(--vscode-font-family, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif);
+  font-size: var(--vscode-font-size, 13px);
+}
+
+#app {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+}
+
+/* ── Top bar (sessions toggle + new chat) ──────────────────────────────── */
+
+.top-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 5px 10px;
+  border-bottom: 1px solid var(--vscode-panel-border, var(--vscode-editorGroup-border, #333));
+  flex-shrink: 0;
+  min-height: 32px;
+}
+
+.top-bar-left {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.top-bar-title {
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  color: var(--vscode-sideBarSectionHeader-foreground, var(--vscode-foreground));
+  cursor: pointer;
+  user-select: none;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.top-bar-title .chevron {
+  font-size: 9px;
+  transition: transform 0.15s;
+}
+
+.top-bar-title .chevron.open {
+  transform: rotate(90deg);
+}
+
+.top-bar-actions {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+}
+
+.icon-btn {
+  background: none;
+  border: none;
+  color: var(--vscode-foreground);
+  cursor: pointer;
+  font-size: 14px;
+  padding: 3px 5px;
+  border-radius: 4px;
+  line-height: 1;
+  opacity: 0.7;
+}
+
+.icon-btn:hover {
+  background: var(--vscode-list-hoverBackground);
+  opacity: 1;
+}
+
+/* ── Sessions bar (horizontal, collapsible) ────────────────────────────── */
+
+.sessions-bar {
+  border-bottom: 1px solid var(--vscode-panel-border, var(--vscode-editorGroup-border, #333));
+  flex-shrink: 0;
+  overflow: hidden;
+  transition: max-height 0.2s ease;
+}
+
+.sessions-bar.collapsed {
+  max-height: 0 !important;
+  border-bottom: none;
+}
+
+.sessions-scroll {
+  display: flex;
+  flex-direction: column;
+  overflow-y: auto;
+  max-height: 180px;
+  padding: 2px 0;
+}
+
+.session-item {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 10px;
+  cursor: pointer;
+  min-height: 26px;
+  flex-shrink: 0;
+}
+
+.session-item:hover {
+  background: var(--vscode-list-hoverBackground);
+}
+
+.session-item.active {
+  background: var(--vscode-list-activeSelectionBackground);
+  color: var(--vscode-list-activeSelectionForeground, var(--vscode-foreground));
+}
+
+.session-title {
+  flex: 1;
+  font-size: 12px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  min-width: 0;
+}
+
+.session-time {
+  font-size: 10px;
+  opacity: 0.45;
+  flex-shrink: 0;
+  white-space: nowrap;
+}
+
+.session-delete {
+  background: none;
+  border: none;
+  color: var(--vscode-foreground);
+  cursor: pointer;
+  opacity: 0;
+  font-size: 14px;
+  padding: 0 2px;
+  flex-shrink: 0;
+  line-height: 1;
+}
+
+.session-item:hover .session-delete {
+  opacity: 0.5;
+}
+
+.session-delete:hover {
+  opacity: 1 !important;
+}
+
+.sessions-empty {
+  padding: 8px 10px;
+  opacity: 0.4;
+  font-size: 11px;
+  text-align: center;
+}
+
+/* ── Chat area ─────────────────────────────────────────────────────────── */
+
+.chat-area {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.chat-empty {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-direction: column;
+  gap: 8px;
+  opacity: 0.45;
+  padding: 20px;
+  text-align: center;
+}
+
+.chat-empty-icon {
+  font-size: 32px;
+}
+
+.chat-empty-text {
+  font-size: 13px;
+}
+
+.messages-container {
+  flex: 1;
+  overflow-y: auto;
+  padding: 12px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.message {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  max-width: 100%;
+}
+
+.message-role {
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.3px;
+  opacity: 0.7;
+}
+
+.message-content {
+  font-size: 13px;
+  line-height: 1.5;
+  word-wrap: break-word;
+  overflow-wrap: break-word;
+}
+
+.message-user .message-role {
+  color: var(--vscode-terminal-ansiBlue, #569cd6);
+}
+
+.message-assistant .message-role {
+  color: var(--vscode-terminal-ansiGreen, #4ec9b0);
+}
+
+/* ── Markdown rendering ────────────────────────────────────────────────── */
+
+.message-content p { margin: 4px 0; }
+
+.message-content code {
+  background: var(--vscode-textCodeBlock-background, rgba(255,255,255,0.06));
+  padding: 1px 4px;
+  border-radius: 3px;
+  font-family: var(--vscode-editor-font-family, 'Cascadia Code', Consolas, monospace);
+  font-size: 12px;
+}
+
+.message-content pre {
+  background: var(--vscode-editor-background);
+  border: 1px solid var(--vscode-panel-border, #444);
+  border-radius: 4px;
+  padding: 10px 12px;
+  margin: 6px 0;
+  overflow-x: auto;
+}
+
+.message-content pre code {
+  background: none;
+  padding: 0;
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.message-content strong { font-weight: 600; }
+
+.message-content a {
+  color: var(--vscode-textLink-foreground, #3794ff);
+  text-decoration: none;
+}
+.message-content a:hover { text-decoration: underline; }
+
+.message-content ul,
+.message-content ol {
+  margin: 4px 0;
+  padding-left: 20px;
+}
+.message-content li { margin: 2px 0; }
+
+.streaming-cursor::after {
+  content: '▍';
+  animation: blink 1s step-end infinite;
+  color: var(--vscode-foreground);
+}
+
+@keyframes blink { 50% { opacity: 0; } }
+
+.message-error {
+  color: var(--vscode-errorForeground, #f44747);
+  background: var(--vscode-inputValidation-errorBackground, rgba(244,71,71,0.1));
+  border: 1px solid var(--vscode-inputValidation-errorBorder, #f44747);
+  border-radius: 4px;
+  padding: 8px 10px;
+  font-size: 12px;
+}
+
+/* ── Input box (Copilot-style self-contained) ──────────────────────────── */
+
+.input-box {
+  flex-shrink: 0;
+  margin: 4px 8px 8px;
+  background: var(--vscode-input-background);
+  border: 1px solid var(--vscode-input-border, #444);
+  border-radius: 8px;
+  display: flex;
+  flex-direction: column;
+  position: relative;
+  overflow: visible;
+}
+
+.input-box:focus-within {
+  border-color: var(--vscode-focusBorder, #007acc);
+}
+
+.chat-input {
+  width: 100%;
+  min-height: 44px;
+  max-height: 140px;
+  resize: none;
+  background: transparent;
+  color: var(--vscode-input-foreground, var(--vscode-foreground));
+  border: none;
+  padding: 10px 10px 2px;
+  font-size: 13px;
+  font-family: inherit;
+  line-height: 1.4;
+  outline: none;
+}
+
+.chat-input::placeholder {
+  color: var(--vscode-input-placeholderForeground, rgba(255,255,255,0.35));
+}
+
+/* Toolbar row inside the input box */
+.input-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 2px 6px 6px;
+}
+
+.input-toolbar-left {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+}
+
+.input-toolbar-right {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+/* Toolbar pill buttons (mode + model selectors) */
+.pill-btn {
+  background: none;
+  border: none;
+  color: var(--vscode-foreground);
+  font-size: 11px;
+  padding: 2px 7px;
+  border-radius: 3px;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  gap: 3px;
+  opacity: 0.7;
+  white-space: nowrap;
+}
+
+.pill-btn:hover {
+  background: var(--vscode-list-hoverBackground);
+  opacity: 1;
+}
+
+.pill-btn .arrow {
+  font-size: 7px;
+  opacity: 0.6;
+}
+
+.pill-btn .pill-label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 130px;
+}
+
+.send-btn {
+  background: var(--vscode-button-background, #0e639c);
+  color: var(--vscode-button-foreground, #fff);
+  border: none;
+  border-radius: 4px;
+  width: 28px;
+  height: 24px;
+  font-size: 14px;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+}
+
+.send-btn:hover {
+  background: var(--vscode-button-hoverBackground, #1177bb);
+}
+
+.send-btn:disabled {
+  opacity: 0.35;
+  cursor: not-allowed;
+}
+
+/* Stop button (red square, shown during streaming) */
+.stop-btn {
+  background: #c23;
+  color: #fff;
+  border: none;
+  border-radius: 4px;
+  width: 28px;
+  height: 24px;
+  font-size: 10px;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+}
+
+.stop-btn:hover {
+  background: #e33;
+}
+
+/* ── Edit mode for sent messages ───────────────────────────────────────── */
+
+.message-role-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.msg-edit-btn {
+  background: none;
+  border: none;
+  color: var(--vscode-foreground);
+  cursor: pointer;
+  font-size: 12px;
+  padding: 0 2px;
+  opacity: 0;
+  transition: opacity 0.1s;
+}
+
+.message-user:hover .msg-edit-btn {
+  opacity: 0.5;
+}
+
+.msg-edit-btn:hover {
+  opacity: 1 !important;
+}
+
+.message-editing {
+  border: 1px solid var(--vscode-focusBorder, #007acc);
+  border-radius: 6px;
+  padding: 8px;
+}
+
+.edit-textarea {
+  width: 100%;
+  min-height: 50px;
+  max-height: 200px;
+  resize: vertical;
+  background: var(--vscode-input-background);
+  color: var(--vscode-input-foreground, var(--vscode-foreground));
+  border: 1px solid var(--vscode-input-border, #444);
+  border-radius: 4px;
+  padding: 8px;
+  font-size: 13px;
+  font-family: inherit;
+  line-height: 1.4;
+  margin: 4px 0;
+}
+
+.edit-textarea:focus {
+  outline: 1px solid var(--vscode-focusBorder);
+  border-color: var(--vscode-focusBorder);
+}
+
+.edit-attachments {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin: 4px 0;
+}
+
+.edit-actions {
+  display: flex;
+  gap: 6px;
+  justify-content: flex-end;
+  margin-top: 4px;
+}
+
+.edit-cancel-btn {
+  background: var(--vscode-button-secondaryBackground, #3a3d41);
+  color: var(--vscode-button-secondaryForeground, var(--vscode-foreground));
+  border: none;
+  border-radius: 4px;
+  padding: 4px 12px;
+  font-size: 12px;
+  cursor: pointer;
+  font-family: inherit;
+}
+
+.edit-cancel-btn:hover {
+  background: var(--vscode-button-secondaryHoverBackground, #45494e);
+}
+
+.edit-resend-btn {
+  background: var(--vscode-button-background, #0e639c);
+  color: var(--vscode-button-foreground, #fff);
+  border: none;
+  border-radius: 4px;
+  padding: 4px 12px;
+  font-size: 12px;
+  cursor: pointer;
+  font-family: inherit;
+}
+
+.edit-resend-btn:hover {
+  background: var(--vscode-button-hoverBackground, #1177bb);
+}
+
+/* ── Table & blockquote styles ─────────────────────────────────────────── */
+
+.message-content table {
+  border-collapse: collapse;
+  width: 100%;
+  margin: 6px 0;
+  font-size: 12px;
+}
+
+.message-content th,
+.message-content td {
+  border: 1px solid var(--vscode-panel-border, #444);
+  padding: 4px 8px;
+  text-align: left;
+}
+
+.message-content th {
+  background: var(--vscode-editor-background);
+  font-weight: 600;
+}
+
+.message-content tr:hover td {
+  background: var(--vscode-list-hoverBackground);
+}
+
+.message-content blockquote {
+  border-left: 3px solid var(--vscode-focusBorder, #007acc);
+  margin: 6px 0;
+  padding: 4px 10px;
+  opacity: 0.85;
+}
+
+.message-content hr {
+  border: none;
+  border-top: 1px solid var(--vscode-panel-border, #444);
+  margin: 8px 0;
+}
+
+.message-content del {
+  opacity: 0.5;
+  text-decoration: line-through;
+}
+
+.message-content h1 { font-size: 1.3em; margin: 8px 0 4px; }
+.message-content h2 { font-size: 1.15em; margin: 6px 0 3px; }
+.message-content h3 { font-size: 1.05em; margin: 4px 0 2px; }
+.message-content h4 { font-size: 1em; margin: 4px 0 2px; font-weight: 600; }
+
+/* ── Dropup menus (mode selector + model picker) ──────────────────────── */
+
+.dropup-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 100;
+}
+
+.dropup-menu {
+  position: absolute;
+  bottom: calc(100% + 4px);
+  background: var(--vscode-editorWidget-background, var(--vscode-sideBar-background));
+  border: 1px solid var(--vscode-editorWidget-border, var(--vscode-panel-border, #444));
+  border-radius: 6px;
+  padding: 4px 0;
+  min-width: 180px;
+  max-width: 300px;
+  max-height: 260px;
+  overflow-y: auto;
+  box-shadow: 0 -3px 12px rgba(0, 0, 0, 0.35);
+  z-index: 101;
+}
+
+.dropup-menu.align-left { left: 6px; }
+.dropup-menu.align-right { right: 6px; }
+
+.dropup-title {
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  padding: 4px 10px 4px;
+  opacity: 0.45;
+}
+
+.dropup-item {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 10px;
+  cursor: pointer;
+  font-size: 12px;
+}
+
+.dropup-item:hover {
+  background: var(--vscode-list-hoverBackground);
+}
+
+.dropup-item.selected {
+  background: var(--vscode-list-activeSelectionBackground);
+  color: var(--vscode-list-activeSelectionForeground, var(--vscode-foreground));
+}
+
+.dropup-item.disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.dropup-item-name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.dropup-item-badge {
+  font-size: 10px;
+  flex-shrink: 0;
+}
+
+.dropup-item-right {
+  font-size: 10px;
+  opacity: 0.5;
+  flex-shrink: 0;
+}
+
+.wip-badge {
+  font-size: 9px;
+  opacity: 0.6;
+  padding: 1px 5px;
+  border-radius: 3px;
+  background: var(--vscode-badge-background, #4d4d4d);
+  color: var(--vscode-badge-foreground, #ccc);
+}
+
+.dropup-separator {
+  height: 1px;
+  background: var(--vscode-panel-border, #444);
+  margin: 3px 0;
+}
+
+/* Model tier badges */
+.model-badge-high   { color: #4caf50; }
+.model-badge-medium { color: #ff9800; }
+.model-badge-low    { color: #f44336; }
+
+.model-not-installed { opacity: 0.5; }
+
+.model-download-btn {
+  background: var(--vscode-button-secondaryBackground, #3a3d41);
+  color: var(--vscode-button-secondaryForeground, var(--vscode-foreground));
+  border: none;
+  border-radius: 3px;
+  padding: 1px 7px;
+  font-size: 10px;
+  cursor: pointer;
+  flex-shrink: 0;
+}
+
+.model-download-btn:hover {
+  background: var(--vscode-button-secondaryHoverBackground, #45494e);
+}
+
+.model-progress {
+  font-size: 10px;
+  opacity: 0.8;
+  flex-shrink: 0;
+}
+
+/* ── Token counter (pie chart circle) ──────────────────────────────────── */
+
+.token-counter {
+  position: relative;
+  width: 22px;
+  height: 22px;
+  flex-shrink: 0;
+  cursor: default;
+}
+
+.token-counter svg {
+  width: 22px;
+  height: 22px;
+  transform: rotate(-90deg);
+}
+
+.token-counter .ring-bg {
+  fill: none;
+  stroke: var(--vscode-editorWidget-border, #444);
+  stroke-width: 3;
+}
+
+.token-counter .ring-fill {
+  fill: none;
+  stroke-width: 3;
+  stroke-linecap: round;
+  transition: stroke-dashoffset 0.3s, stroke 0.3s;
+}
+
+.token-counter .ring-fill.green  { stroke: #4caf50; }
+.token-counter .ring-fill.yellow { stroke: #ff9800; }
+.token-counter .ring-fill.red    { stroke: #f44336; }
+
+.token-counter .tc-label {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 7px;
+  font-weight: 600;
+  opacity: 0.8;
+}
+
+/* Hover tooltip for token breakdown */
+.token-tooltip {
+  display: none;
+  position: absolute;
+  bottom: calc(100% + 6px);
+  right: 0;
+  background: var(--vscode-editorWidget-background, var(--vscode-sideBar-background));
+  border: 1px solid var(--vscode-editorWidget-border, #444);
+  border-radius: 6px;
+  padding: 8px 10px;
+  font-size: 11px;
+  white-space: nowrap;
+  box-shadow: 0 -2px 10px rgba(0,0,0,0.3);
+  z-index: 200;
+  min-width: 160px;
+}
+
+.token-counter.tooltip-visible .token-tooltip {
+  display: block;
+}
+
+.token-tooltip-row {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 1px 0;
+}
+
+.token-tooltip-label {
+  opacity: 0.7;
+}
+
+.token-tooltip-value {
+  font-weight: 600;
+  text-align: right;
+}
+
+.token-tooltip-sep {
+  height: 1px;
+  background: var(--vscode-panel-border, #444);
+  margin: 4px 0;
+}
+
+/* Compact conversation button inside tooltip */
+.compact-btn {
+  width: 100%;
+  background: var(--vscode-button-secondaryBackground, #3a3d41);
+  color: var(--vscode-button-secondaryForeground, var(--vscode-foreground));
+  border: none;
+  border-radius: 4px;
+  padding: 4px 8px;
+  font-size: 11px;
+  cursor: pointer;
+  font-family: inherit;
+  margin-top: 2px;
+}
+
+.compact-btn:hover {
+  background: var(--vscode-button-secondaryHoverBackground, #45494e);
+}
+
+.compact-btn-disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.compact-btn-disabled:hover {
+  background: var(--vscode-button-secondaryBackground, #3a3d41);
+}
+
+/* ── Message attachment tags ───────────────────────────────────────────── */
+
+.msg-attachments {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin-bottom: 4px;
+}
+
+.msg-attachment-tag {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  font-size: 10px;
+  padding: 1px 6px;
+  border-radius: 3px;
+  background: var(--vscode-badge-background, #4d4d4d);
+  color: var(--vscode-badge-foreground, #ccc);
+  opacity: 0.85;
+}
+
+.msg-attachment-tag .tag-icon {
+  font-size: 10px;
+}
+
+.msg-attachment-thumb {
+  width: 14px;
+  height: 14px;
+  border-radius: 2px;
+  object-fit: cover;
+}
+
+/* ── Context bar (attachments + add file button) ───────────────────────── */
+
+.context-bar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px;
+  padding: 6px 8px 2px;
+  min-height: 0;
+}
+
+.context-bar:empty {
+  display: none;
+}
+
+.add-context-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  background: none;
+  border: 1px dashed var(--vscode-input-border, #555);
+  color: var(--vscode-foreground);
+  font-size: 11px;
+  padding: 2px 7px;
+  border-radius: 4px;
+  cursor: pointer;
+  opacity: 0.7;
+  white-space: nowrap;
+}
+
+.add-context-btn:hover {
+  opacity: 1;
+  border-color: var(--vscode-focusBorder, #007acc);
+}
+
+.add-context-btn .plus {
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.attachment-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  background: var(--vscode-badge-background, #4d4d4d);
+  color: var(--vscode-badge-foreground, #ccc);
+  font-size: 11px;
+  padding: 2px 4px 2px 7px;
+  border-radius: 4px;
+  max-width: 180px;
+  white-space: nowrap;
+}
+
+.attachment-pill .pill-icon {
+  flex-shrink: 0;
+  font-size: 11px;
+}
+
+.attachment-pill .pill-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+
+.attachment-pill .pill-remove {
+  background: none;
+  border: none;
+  color: var(--vscode-foreground);
+  font-size: 13px;
+  padding: 0 2px;
+  cursor: pointer;
+  opacity: 0.5;
+  flex-shrink: 0;
+  line-height: 1;
+}
+
+.attachment-pill .pill-remove:hover {
+  opacity: 1;
+}
+
+.attachment-pill-image {
+  background: var(--vscode-badge-background, #4d4d4d);
+}
+
+.attachment-pill-image .pill-thumb {
+  width: 18px;
+  height: 18px;
+  border-radius: 2px;
+  object-fit: cover;
+  flex-shrink: 0;
+}
+
+/* Drop zone highlight */
+.input-box.drag-over {
+  border-color: var(--vscode-focusBorder, #007acc) !important;
+  background: rgba(0, 127, 255, 0.05);
+}
+
+/* ── Image modal ───────────────────────────────────────────────────────── */
+
+.image-modal-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.75);
+  z-index: 300;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+}
+
+.image-modal-img {
+  max-width: 95%;
+  max-height: 90%;
+  border-radius: 6px;
+  box-shadow: 0 4px 24px rgba(0, 0, 0, 0.6);
+  cursor: default;
+  object-fit: contain;
+}
+
+.image-modal-close {
+  position: absolute;
+  top: 10px;
+  right: 14px;
+  background: rgba(0, 0, 0, 0.6);
+  color: #fff;
+  border: none;
+  border-radius: 50%;
+  width: 28px;
+  height: 28px;
+  font-size: 16px;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.image-modal-close:hover {
+  background: rgba(255, 255, 255, 0.2);
+}
+
+/* Make attachment thumbnails clickable */
+.msg-attachment-thumb {
+  cursor: pointer;
+}
+
+/* ── Scrollbar styling ─────────────────────────────────────────────────── */
+
+::-webkit-scrollbar { width: 6px; height: 6px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb {
+  background: var(--vscode-scrollbarSlider-background, rgba(255,255,255,0.15));
+  border-radius: 3px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: var(--vscode-scrollbarSlider-hoverBackground, rgba(255,255,255,0.25));
+}
