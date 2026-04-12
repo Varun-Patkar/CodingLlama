@@ -14,10 +14,15 @@ import { SessionManager } from './sessionManager';
  * Registers the sidebar webview provider and all commands.
  */
 export function activate(context: vscode.ExtensionContext): void {
-  const sessions = new SessionManager(context.globalState);
+  const workspaceFolder = vscode.workspace.workspaceFolders?.[0]?.uri ?? undefined;
+  const sessions = new SessionManager(workspaceFolder);
   const provider = new SidebarProvider(context.extensionUri, sessions, context.globalStorageUri);
 
-  // Clean up images older than 30 days (fire-and-forget)
+  // Initialize file-based session storage + clean old images (fire-and-forget)
+  sessions.init().then(() => {
+    // Ensure .codingllama is gitignored in workspace repos
+    if (workspaceFolder) { ensureGitignore(workspaceFolder); }
+  });
   provider.cleanupOldImages();
 
   // Register the webview view provider — retainContextWhenHidden keeps the
@@ -57,4 +62,42 @@ export function activate(context: vscode.ExtensionContext): void {
 /** Called by VS Code when the extension is deactivated. */
 export function deactivate(): void {
   // Nothing to clean up — disposables are managed via context.subscriptions
+}
+
+/**
+ * Ensures `.codingllama` is in .gitignore for the workspace.
+ * Only acts if the workspace is a git repo (.git folder exists).
+ * Creates .gitignore if it doesn't exist; appends if it does.
+ */
+async function ensureGitignore(workspaceUri: vscode.Uri): Promise<void> {
+  try {
+    // Check if .git folder exists — only add gitignore for git repos
+    const gitUri = vscode.Uri.joinPath(workspaceUri, '.git');
+    try {
+      await vscode.workspace.fs.stat(gitUri);
+    } catch {
+      return; // Not a git repo, skip
+    }
+
+    const gitignoreUri = vscode.Uri.joinPath(workspaceUri, '.gitignore');
+    const entry = '.codingllama/';
+
+    try {
+      // .gitignore exists — check if already has the entry
+      const bytes = await vscode.workspace.fs.readFile(gitignoreUri);
+      const content = Buffer.from(bytes).toString('utf8');
+      if (content.includes(entry)) { return; } // Already there
+
+      // Append the entry (with newline before if file doesn't end with one)
+      const suffix = content.endsWith('\n') ? '' : '\n';
+      const updated = content + suffix + '\n# CodingLlama session data\n' + entry + '\n';
+      await vscode.workspace.fs.writeFile(gitignoreUri, Buffer.from(updated, 'utf8'));
+    } catch {
+      // .gitignore doesn't exist — create it
+      const newContent = '# CodingLlama session data\n' + entry + '\n';
+      await vscode.workspace.fs.writeFile(gitignoreUri, Buffer.from(newContent, 'utf8'));
+    }
+  } catch {
+    // Silently ignore any errors — not critical
+  }
 }

@@ -1,135 +1,202 @@
 /**
- * SessionManager — CRUD operations for chat sessions stored in VS Code globalState.
+ * SessionManager — CRUD operations for chat sessions stored as JSON files.
  *
- * Sessions are stored under the key "codingLlama.sessions" as a JSON array.
- * The active session ID is stored under "codingLlama.activeSessionId".
- * A maximum of 50 sessions are retained; the oldest are dropped when the limit is hit.
+ * Sessions live in `.codingllama/sessions/` under the workspace root.
+ * Each session = `{id}.json`. An `index.json` stores lightweight metadata.
+ * No workspace → fallback to `~/.codingllama/sessions/`.
+ * Max 50 sessions; oldest dropped when limit hit.
  */
 import * as vscode from 'vscode';
+import * as path from 'path';
 
 /** Attachment metadata stored with messages. */
 export interface StoredAttachment {
   type: 'file' | 'image' | 'selection';
   name: string;
-  /** For images: relative path under globalStorageUri where the image is saved. */
   imagePath?: string;
+  imageUri?: string;
 }
 
 /** A single message in a chat session. */
 export interface Message {
   role: 'user' | 'assistant' | 'system';
   content: string;
-  /** Attachment names/types for display (content is NOT stored to save space). */
   attachments?: StoredAttachment[];
+  /** Model that generated this response (assistant messages only). */
+  model?: string;
 }
 
-/** A persisted chat session. */
+/** Session status for UI display. */
+export type SessionStatus = 'streaming' | 'unread' | 'read';
+
+/** Lightweight metadata stored in index.json. */
+export interface SessionMeta {
+  id: string;
+  title: string;
+  createdAt: number;
+  status: SessionStatus;
+}
+
+/** A compaction checkpoint — covers messages[0..upTo-1]. */
+export interface CompactionCheckpoint {
+  /** Messages index up to which this compaction covers (exclusive). */
+  upTo: number;
+  /** LLM-generated summary of messages[prevUpTo..upTo-1]. */
+  summary: string;
+}
+
+/** A full persisted chat session. */
 export interface Session {
   id: string;
   title: string;
   createdAt: number;
+  status: SessionStatus;
   messages: Message[];
+  /**
+   * Stacking compaction checkpoints.
+   * Each entry covers messages from the previous checkpoint's upTo (or 0) to this upTo.
+   * On edit at index N: discard all checkpoints where upTo > N.
+   * For LLM context: combine all valid checkpoint summaries, then add raw messages after last checkpoint.
+   */
+  compactions?: CompactionCheckpoint[];
+  /**
+   * Redo stack — messages that were removed by a checkpoint restore.
+   * Redo replays these back onto the session (no LLM call).
+   * Cleared when user sends a new message or edits.
+   */
+  redoStack?: Message[];
 }
 
-const STORAGE_KEY = 'codingLlama.sessions';
-const ACTIVE_KEY  = 'codingLlama.activeSessionId';
 const MAX_SESSIONS = 50;
+const SESSIONS_DIR = '.codingllama/sessions';
+const INDEX_FILE = 'index.json';
 
 export class SessionManager {
-  constructor(private state: vscode.Memento) {}
+  private _sessionsDir: vscode.Uri;
+  private _activeId: string | null = null;
+  private _index: SessionMeta[] = [];
+  private _cache: Map<string, Session> = new Map();
 
-  /** Returns all stored sessions, newest first. */
-  getAll(): Session[] {
-    return this.state.get<Session[]>(STORAGE_KEY, []);
+  constructor(workspaceFolder: vscode.Uri | undefined) {
+    if (workspaceFolder) {
+      this._sessionsDir = vscode.Uri.joinPath(workspaceFolder, SESSIONS_DIR);
+    } else {
+      const home = process.env.USERPROFILE || process.env.HOME || 'C:\\Users\\Default';
+      this._sessionsDir = vscode.Uri.file(path.join(home, SESSIONS_DIR));
+    }
   }
 
-  /** Returns the currently active session, or null if none is set. */
-  getActive(): Session | null {
-    const id = this.state.get<string>(ACTIVE_KEY);
-    if (!id) { return null; }
-    return this.getAll().find(s => s.id === id) ?? null;
+  async init(): Promise<void> {
+    try { await vscode.workspace.fs.createDirectory(this._sessionsDir); } catch { /* exists */ }
+    await this._loadIndex();
   }
 
-  /**
-   * Creates a new empty session, prepends it to the list, trims to MAX_SESSIONS,
-   * and sets it as the active session.
-   */
-  createNew(): Session {
+  private async _loadIndex(): Promise<void> {
+    try {
+      const uri = vscode.Uri.joinPath(this._sessionsDir, INDEX_FILE);
+      const bytes = await vscode.workspace.fs.readFile(uri);
+      this._index = JSON.parse(Buffer.from(bytes).toString('utf8'));
+    } catch { this._index = []; }
+  }
+
+  private async _saveIndex(): Promise<void> {
+    const uri = vscode.Uri.joinPath(this._sessionsDir, INDEX_FILE);
+    await vscode.workspace.fs.writeFile(uri, Buffer.from(JSON.stringify(this._index, null, 2), 'utf8'));
+  }
+
+  private async _readSession(id: string): Promise<Session | null> {
+    if (this._cache.has(id)) { return this._cache.get(id)!; }
+    try {
+      const uri = vscode.Uri.joinPath(this._sessionsDir, `${id}.json`);
+      const bytes = await vscode.workspace.fs.readFile(uri);
+      const session = JSON.parse(Buffer.from(bytes).toString('utf8')) as Session;
+      this._cache.set(id, session);
+      return session;
+    } catch { return null; }
+  }
+
+  private async _writeSession(session: Session): Promise<void> {
+    this._cache.set(session.id, session);
+    const uri = vscode.Uri.joinPath(this._sessionsDir, `${session.id}.json`);
+    await vscode.workspace.fs.writeFile(uri, Buffer.from(JSON.stringify(session, null, 2), 'utf8'));
+  }
+
+  private async _deleteSessionFile(id: string): Promise<void> {
+    this._cache.delete(id);
+    try {
+      await vscode.workspace.fs.delete(vscode.Uri.joinPath(this._sessionsDir, `${id}.json`));
+    } catch { /* file might not exist */ }
+  }
+
+  getAllMeta(): SessionMeta[] { return this._index; }
+
+  getActiveId(): string | null { return this._activeId; }
+
+  async getActive(): Promise<Session | null> {
+    if (!this._activeId) { return null; }
+    return this._readSession(this._activeId);
+  }
+
+  async getSession(id: string): Promise<Session | null> {
+    return this._readSession(id);
+  }
+
+  async createNew(): Promise<Session> {
     const session: Session = {
       id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
       title: 'New Chat',
       createdAt: Date.now(),
+      status: 'read',
       messages: [],
     };
-
-    let sessions = this.getAll();
-    sessions.unshift(session);
-    if (sessions.length > MAX_SESSIONS) {
-      sessions = sessions.slice(0, MAX_SESSIONS);
+    this._index.unshift({ id: session.id, title: session.title, createdAt: session.createdAt, status: session.status });
+    if (this._index.length > MAX_SESSIONS) {
+      const removed = this._index.splice(MAX_SESSIONS);
+      for (const r of removed) { await this._deleteSessionFile(r.id); }
     }
-
-    this.state.update(STORAGE_KEY, sessions);
-    this.state.update(ACTIVE_KEY, session.id);
+    this._activeId = session.id;
+    await this._writeSession(session);
+    await this._saveIndex();
     return session;
   }
 
-  /** Sets the active session by ID. */
-  setActive(id: string): void {
-    this.state.update(ACTIVE_KEY, id);
+  setActive(id: string): void { this._activeId = id; }
+
+  async saveSession(session: Session): Promise<void> {
+    await this._writeSession(session);
+    const meta = this._index.find(m => m.id === session.id);
+    if (meta) { meta.title = session.title; meta.status = session.status; }
+    await this._saveIndex();
   }
 
-  /**
-   * Re-persists the full sessions array.
-   * Call this after mutating a session's messages in place.
-   */
-  save(sessions: Session[]): void {
-    this.state.update(STORAGE_KEY, sessions);
+  async updateTitle(id: string, title: string): Promise<void> {
+    const truncated = title.length > 40 ? title.slice(0, 40) + '...' : title;
+    const meta = this._index.find(m => m.id === id);
+    if (meta) { meta.title = truncated; }
+    const session = this._cache.get(id);
+    if (session) { session.title = truncated; await this._writeSession(session); }
+    await this._saveIndex();
   }
 
-  /**
-   * Saves a single mutated session back into the stored sessions array.
-   * Finds the session by ID and replaces it, then persists.
-   */
-  saveSession(session: Session): void {
-    const sessions = this.getAll();
-    const idx = sessions.findIndex(s => s.id === session.id);
-    if (idx >= 0) {
-      sessions[idx] = session;
-    } else {
-      sessions.unshift(session);
-    }
-    this.state.update(STORAGE_KEY, sessions);
+  async setStatus(id: string, status: SessionStatus): Promise<void> {
+    const meta = this._index.find(m => m.id === id);
+    if (meta) { meta.status = status; }
+    const session = this._cache.get(id);
+    if (session) { session.status = status; }
+    await this._saveIndex();
   }
 
-  /**
-   * Updates the title of a session to the first user message,
-   * truncated to 40 characters.
-   */
-  updateTitle(id: string, firstMessage: string): void {
-    const sessions = this.getAll();
-    const session = sessions.find(s => s.id === id);
-    if (session) {
-      session.title = firstMessage.length > 40
-        ? firstMessage.slice(0, 40) + '...'
-        : firstMessage;
-      this.state.update(STORAGE_KEY, sessions);
-    }
+  async delete(id: string): Promise<void> {
+    this._index = this._index.filter(m => m.id !== id);
+    await this._deleteSessionFile(id);
+    if (this._activeId === id) { this._activeId = null; }
+    await this._saveIndex();
   }
 
-  /** Deletes a session by ID. */
-  delete(id: string): void {
-    const sessions = this.getAll().filter(s => s.id !== id);
-    this.state.update(STORAGE_KEY, sessions);
-    // If the deleted session was active, clear the active key
-    const activeId = this.state.get<string>(ACTIVE_KEY);
-    if (activeId === id) {
-      this.state.update(ACTIVE_KEY, undefined);
-    }
-  }
-
-  /** Removes all sessions and clears the active session. */
-  clearAll(): void {
-    this.state.update(STORAGE_KEY, []);
-    this.state.update(ACTIVE_KEY, undefined);
+  async clearAll(): Promise<void> {
+    for (const meta of this._index) { await this._deleteSessionFile(meta.id); }
+    this._index = [];
+    this._activeId = null;
+    await this._saveIndex();
   }
 }

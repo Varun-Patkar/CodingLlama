@@ -5,31 +5,38 @@
  *  - Renders the webview HTML (via webviewHtml.ts)
  *  - Handles all postMessage traffic between the webview and the extension host
  *  - Bridges chat input → Ollama streaming → token-by-token updates to the webview
+ *  - Supports parallel streaming across multiple sessions
+ *  - Generates session titles via LLM before streaming answers
  *  - Manages model listing + pull via ollamaClient
- *  - Coordinates session CRUD via SessionManager
+ *  - Coordinates session CRUD via SessionManager (file-based)
  */
 import * as vscode from 'vscode';
 import { getHtml } from './webviewHtml';
-import { streamOllama, listModels, pullModel, checkOllama, ContentPart, MessageContent } from './ollamaClient';
-import { SessionManager, Session } from './sessionManager';
+import { streamOllama, listModels, pullModel, checkOllama, getModelContextSize, ContentPart, MessageContent } from './ollamaClient';
+import { SessionManager, Session, CompactionCheckpoint } from './sessionManager';
 import { getConfig, setModel } from './config';
-import { ASK_SYSTEM_PROMPT, COMPACT_CONVERSATION_PROMPT, SYSTEM_PROMPT_TOKENS } from './prompts';
+import { ASK_SYSTEM_PROMPT, TITLE_GENERATOR_PROMPT, COMPACT_CONVERSATION_PROMPT, SYSTEM_PROMPT_TOKENS } from './prompts';
 
 /** Attachment sent from the webview with each chat message. */
 interface Attachment {
   type: 'file' | 'selection' | 'image';
   name: string;
-  content?: string;   // text content for file/selection
-  dataUrl?: string;    // base64 data URL for images
+  content?: string;
+  dataUrl?: string;
+}
+
+/** Tracks an active streaming request for a specific session. */
+interface StreamState {
+  abortController: AbortController;
+  fullResponse: string;
 }
 
 export class SidebarProvider implements vscode.WebviewViewProvider {
-  /** The view ID — must match views contribution in package.json. */
   public static readonly viewId = 'codingLlama.chatView';
 
   private _view?: vscode.WebviewView;
-  /** AbortController for the current streaming request — null when idle. */
-  private _abortController: AbortController | null = null;
+  /** Active streams per session — enables parallel streaming. */
+  private _streams: Map<string, StreamState> = new Map();
 
   constructor(
     private readonly _extensionUri: vscode.Uri,
@@ -37,95 +44,63 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
     private readonly _storageUri: vscode.Uri,
   ) {}
 
-  /**
-   * Called by VS Code when the webview view becomes visible.
-   * Sets up the webview HTML, options, and message listener.
-   */
   resolveWebviewView(
     webviewView: vscode.WebviewView,
     _context: vscode.WebviewViewResolveContext,
     _token: vscode.CancellationToken
   ): void {
     this._view = webviewView;
-
     webviewView.webview.options = {
       enableScripts: true,
       localResourceRoots: [this._extensionUri, this._storageUri],
     };
-
     webviewView.webview.html = getHtml(webviewView.webview, this._extensionUri);
-
-    // Single message listener dispatches to the handler switch
-    webviewView.webview.onDidReceiveMessage(
-      (msg) => this._handleMessage(msg)
-    );
-
-    // Track active editor changes to update the "add current file" button
+    webviewView.webview.onDidReceiveMessage((msg) => this._handleMessage(msg));
     vscode.window.onDidChangeActiveTextEditor(() => this._sendEditorContext());
     vscode.window.onDidChangeTextEditorSelection(() => this._sendEditorContext());
   }
 
-  // ── Public API (for commands registered in extension.ts) ──────────────
+  // ── Public API ────────────────────────────────────────────────────────
 
-  /** Creates a new chat session and refreshes the webview. */
-  public newChat(): void {
-    this._sessions.createNew();
+  public async newChat(): Promise<void> {
+    await this._sessions.createNew();
     this._postSessions();
-    this._postActiveSession();
+    await this._postActiveSession();
   }
 
-  /** Clears all sessions and refreshes the webview. */
-  public clearAll(): void {
-    this._sessions.clearAll();
+  public async clearAll(): Promise<void> {
+    // Abort all active streams
+    for (const [, s] of this._streams) { s.abortController.abort(); }
+    this._streams.clear();
+    await this._sessions.clearAll();
     this._postSessions();
-    this._postActiveSession();
+    await this._postActiveSession();
   }
 
-  /**
-   * Adds one or more files to the chat as attachments.
-   * Called from the explorer/editor context menu command.
-   */
   public async addFiles(uris: vscode.Uri[]): Promise<void> {
-    // If no URIs passed, try the active editor
     if (uris.length === 0) {
       const activeUri = vscode.window.activeTextEditor?.document.uri;
       if (activeUri) { uris = [activeUri]; }
     }
-
-    for (const fileUri of uris) {
-      await this.addFile(fileUri);
-    }
-
-    // Reveal the sidebar so the user sees the added files
-    if (uris.length > 0 && this._view) {
-      this._view.show?.(true);
-    }
+    for (const fileUri of uris) { await this.addFile(fileUri); }
+    if (uris.length > 0 && this._view) { this._view.show?.(true); }
   }
 
-  /**
-   * Adds a single file to the chat as an attachment.
-   */
   public async addFile(uri?: vscode.Uri): Promise<void> {
-    // If no URI passed, try the active editor
     const fileUri = uri ?? vscode.window.activeTextEditor?.document.uri;
     if (!fileUri) { return; }
-
     const fileName = fileUri.path.split('/').pop() ?? fileUri.path;
     try {
       const ext = fileName.split('.').pop()?.toLowerCase() ?? '';
       const imageExts = ['png', 'jpg', 'jpeg', 'gif', 'webp', 'bmp', 'svg'];
-
       if (imageExts.includes(ext)) {
         const bytes = await vscode.workspace.fs.readFile(fileUri);
         const base64 = Buffer.from(bytes).toString('base64');
-        const mimeType = ext === 'svg' ? 'image/svg+xml'
-          : ext === 'jpg' ? 'image/jpeg'
-          : `image/${ext}`;
+        const mimeType = ext === 'svg' ? 'image/svg+xml' : ext === 'jpg' ? 'image/jpeg' : `image/${ext}`;
         this._post({ type: 'imageAdded', name: fileName, dataUrl: `data:${mimeType};base64,${base64}` });
       } else {
         const bytes = await vscode.workspace.fs.readFile(fileUri);
-        const content = Buffer.from(bytes).toString('utf8');
-        this._post({ type: 'fileAdded', name: fileName, content });
+        this._post({ type: 'fileAdded', name: fileName, content: Buffer.from(bytes).toString('utf8') });
       }
     } catch {
       this._post({ type: 'fileAdded', name: fileName, content: `(Failed to read ${fileName})` });
@@ -134,170 +109,141 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
 
   // ── Private helpers ───────────────────────────────────────────────────
 
-  /** Sends a message to the webview. */
   private _post(message: unknown): void {
     this._view?.webview.postMessage(message);
   }
 
-  /** Pushes the full sessions list to the webview. */
   private _postSessions(): void {
-    this._post({ type: 'sessions', sessions: this._sessions.getAll() });
+    this._post({ type: 'sessions', sessions: this._sessions.getAllMeta() });
   }
 
-  /** Pushes the active session (with its messages) to the webview. */
-  private _postActiveSession(): void {
-    const session = this._sessions.getActive();
+  /** Pushes active session with resolved image URIs to webview. */
+  private async _postActiveSession(): Promise<void> {
+    const session = await this._sessions.getActive();
     const { model } = getConfig();
-
-    // Resolve stored image paths to webview-safe URIs for rendering
-    let resolvedSession = session;
+    let resolved = session;
     if (session) {
-      resolvedSession = {
+      resolved = {
         ...session,
         messages: session.messages.map(m => {
           if (!m.attachments) { return m; }
-          return {
-            ...m,
-            attachments: m.attachments.map(a => {
-              if (a.type === 'image' && a.imagePath) {
-                const webviewUri = this._resolveImageUri(a.imagePath);
-                return { ...a, imageUri: webviewUri ?? undefined };
-              }
-              return a;
-            }),
-          };
+          return { ...m, attachments: m.attachments.map(a => {
+            if (a.type === 'image' && a.imagePath) {
+              return { ...a, imageUri: this._resolveImageUri(a.imagePath) ?? undefined };
+            }
+            return a;
+          })};
         }),
       };
     }
-
-    this._post({ type: 'activeSession', session: resolvedSession, selectedModel: model, systemPromptTokens: SYSTEM_PROMPT_TOKENS });
+    this._post({ type: 'activeSession', session: resolved, selectedModel: model, systemPromptTokens: SYSTEM_PROMPT_TOKENS });
   }
 
-  /** Sends the initial state to the webview once it signals "ready". */
   private async _sendInitialState(): Promise<void> {
     this._postSessions();
-    this._postActiveSession();
+    await this._postActiveSession();
     this._sendEditorContext();
-    // Send installed models so the webview can auto-select the best one
     await this._handleGetModels();
   }
 
   // ── Message dispatch ──────────────────────────────────────────────────
 
-  /** Routes incoming webview messages to the appropriate handler. */
   private async _handleMessage(msg: Record<string, unknown>): Promise<void> {
     switch (msg.type) {
       case 'ready':
-        this._sendInitialState();
+        await this._sendInitialState();
         break;
-
       case 'checkOllama':
         await this._handleCheckOllama();
         break;
-
       case 'send':
-        await this._handleChat(
-          msg.text as string,
-          msg.model as string,
-          (msg.attachments as Attachment[] | undefined) || [],
-        );
+        await this._handleChat(msg.text as string, msg.model as string, (msg.attachments as Attachment[] | undefined) || []);
         break;
-
       case 'newChat':
-        this.newChat();
+        await this.newChat();
         break;
-
       case 'selectSession':
         this._sessions.setActive(msg.id as string);
-        this._postActiveSession();
-        break;
-
-      case 'deleteSession':
-        this._sessions.delete(msg.id as string);
+        await this._sessions.setStatus(msg.id as string, 'read');
+        await this._postActiveSession();
         this._postSessions();
-        this._postActiveSession();
+        // If target session is still streaming, replay its state
+        this._replayStreamState(msg.id as string);
         break;
-
+      case 'deleteSession': {
+        const delId = msg.id as string;
+        const stream = this._streams.get(delId);
+        if (stream) { stream.abortController.abort(); this._streams.delete(delId); }
+        await this._sessions.delete(delId);
+        this._postSessions();
+        await this._postActiveSession();
+        break;
+      }
       case 'getModels':
         await this._handleGetModels();
         break;
-
       case 'pullModel':
         await this._handlePullModel(msg.model as string);
         break;
-
       case 'selectModel':
         await this._handleSelectModel(msg.model as string);
         break;
-
       case 'getEditorContext':
         this._sendEditorContext();
         break;
-
       case 'addCurrentFile':
         await this._handleAddCurrentFile();
         break;
-
       case 'addSelection':
         this._handleAddSelection();
         break;
-
       case 'attachFile':
         await this._handleAttachFile();
         break;
-
       case 'readDroppedUri':
         await this._handleReadDroppedUri(msg.uri as string, msg.name as string);
         break;
-
       case 'stopGeneration':
-        this._handleStopGeneration();
+        this._handleStopGeneration(msg.sessionId as string | undefined);
         break;
-
       case 'resend':
-        await this._handleResend(
-          msg.messageIndex as number,
-          msg.text as string,
-          msg.model as string,
-          (msg.attachments as Attachment[] | undefined) || [],
-        );
+        await this._handleResend(msg.messageIndex as number, msg.text as string, msg.model as string, (msg.attachments as Attachment[] | undefined) || []);
         break;
-
       case 'compactConversation':
         await this._handleCompactConversation(msg.model as string);
         break;
-
       case 'compactAndSend':
         await this._handleCompactConversation(msg.model as string);
-        await this._handleChat(
-          msg.text as string,
-          msg.model as string,
-          (msg.attachments as Attachment[] | undefined) || [],
-        );
+        await this._handleChat(msg.text as string, msg.model as string, (msg.attachments as Attachment[] | undefined) || []);
+        break;
+      case 'restoreCheckpoint':
+        await this._handleRestoreCheckpoint(msg.messageIndex as number);
+        break;
+      case 'redoMessages':
+        await this._handleRedo();
+        break;
+      case 'forkConversation':
+        await this._handleFork(msg.messageIndex as number);
         break;
     }
   }
 
-  // ── Chat streaming ────────────────────────────────────────────────────
+  // ── Chat streaming (parallel-capable) ─────────────────────────────────
 
   /**
-   * Handles a user chat message:
-   *  1. Appends the user message to the active session
-   *  2. Updates the session title if it's the first message
-   *  3. Builds context-augmented messages (files, selections, images)
-   *  4. Streams the Ollama response token-by-token to the webview
-   *  5. Appends the completed assistant response to the session
+   * Handles a user chat message with title generation + parallel streaming.
+   * Flow for new sessions: user msg → generate title → stream answer.
+   * Flow for existing sessions: user msg → stream answer directly.
    */
   private async _handleChat(text: string, model: string, attachments: Attachment[]): Promise<void> {
-    // Ensure there's an active session (auto-create if needed)
-    let session = this._sessions.getActive();
+    let session = await this._sessions.getActive();
     if (!session) {
-      session = this._sessions.createNew();
+      session = await this._sessions.createNew();
       this._postSessions();
+      await this._postActiveSession();
     }
 
-    // Append the user message with attachment metadata for display on reload
-    // Save images to persistent storage so they survive across sessions
+    // Save images to persistent storage
     const storedAttachments = attachments.length > 0
       ? await Promise.all(attachments.map(async (a) => {
           if (a.type === 'image' && a.dataUrl) {
@@ -307,150 +253,291 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
           return { type: a.type as 'file' | 'image' | 'selection', name: a.name };
         }))
       : undefined;
+
     session.messages.push({ role: 'user', content: text, attachments: storedAttachments });
 
-    // Set the session title from the first user message
+    // New message invalidates redo stack
+    session.redoStack = undefined;
+
+    // Title generation for new sessions (first user message)
     const userMessages = session.messages.filter(m => m.role === 'user');
     if (userMessages.length === 1) {
-      this._sessions.updateTitle(session.id, text);
+      // Generate title via quick non-streaming LLM call
+      await this._generateTitle(session, text, model);
       this._postSessions();
     }
 
-    // Persist the user message immediately
-    this._sessions.saveSession(session);
-    this._post({ type: 'userMessage', text });
-    this._post({ type: 'streamStart' });
+    // Persist user message
+    session.status = 'streaming';
+    await this._sessions.saveSession(session);
+    this._postSessions();
+    // Push updated session so webview has the user message before streaming starts
+    await this._postActiveSession();
+    this._post({ type: 'streamStart', sessionId: session.id });
 
-    // Persist selected model
     await setModel(model);
 
-    // Build the final messages array for Ollama
-    // Prepend system prompt, then previous messages, then current user message
+    // Build Ollama messages
+    // Use stacking compaction: combine all checkpoint summaries, then raw messages after last checkpoint
     const ollamaMessages: Array<{ role: string; content: MessageContent }> = [
       { role: 'system', content: ASK_SYSTEM_PROMPT },
-      ...session.messages
-        .slice(0, -1) // all but the last (current user message)
-        .map(m => ({ role: m.role, content: m.content })),
     ];
 
-    // Build the current user message with context + images
-    const fileAttachments = attachments.filter(a => a.type === 'file' || a.type === 'selection');
-    const imageAttachments = attachments.filter(a => a.type === 'image');
+    const prevMessages = session.messages.slice(0, -1); // all but current user message
+    const checkpoints = session.compactions || [];
 
+    if (checkpoints.length > 0) {
+      // Combine all checkpoint summaries into context
+      const combinedSummary = checkpoints.map((cp, i) => {
+        const label = checkpoints.length > 1 ? `Summary (part ${i + 1}):` : 'Previous conversation summary:';
+        return `${label}\n${cp.summary}`;
+      }).join('\n\n');
+      ollamaMessages.push({ role: 'system', content: combinedSummary });
+
+      // Add only messages after the last checkpoint
+      const lastUpTo = checkpoints[checkpoints.length - 1].upTo;
+      const postCompactMsgs = prevMessages.slice(lastUpTo);
+      ollamaMessages.push(...postCompactMsgs.map(m => ({ role: m.role, content: m.content })));
+    } else {
+      ollamaMessages.push(...prevMessages.map(m => ({ role: m.role, content: m.content })));
+    }
+
+    const fileAtts = attachments.filter(a => a.type === 'file' || a.type === 'selection');
+    const imageAtts = attachments.filter(a => a.type === 'image');
     let contextText = '';
-    if (fileAttachments.length > 0) {
-      contextText = fileAttachments.map(a => {
+    if (fileAtts.length > 0) {
+      contextText = fileAtts.map(a => {
         const label = a.type === 'selection' ? `Selection from ${a.name}` : `File: ${a.name}`;
         return `--- ${label} ---\n\`\`\`\n${a.content}\n\`\`\``;
       }).join('\n\n') + '\n\n';
     }
     const fullText = contextText + text;
 
-    if (imageAttachments.length > 0) {
-      // Multimodal message: text + images
+    if (imageAtts.length > 0) {
       const parts: ContentPart[] = [{ type: 'text', text: fullText }];
-      for (const img of imageAttachments) {
-        if (img.dataUrl) {
-          parts.push({ type: 'image_url', image_url: { url: img.dataUrl } });
-        }
+      for (const img of imageAtts) {
+        if (img.dataUrl) { parts.push({ type: 'image_url', image_url: { url: img.dataUrl } }); }
       }
       ollamaMessages.push({ role: 'user', content: parts });
     } else {
       ollamaMessages.push({ role: 'user', content: fullText });
     }
 
-    let fullResponse = '';
-
-    this._abortController = new AbortController();
-    const { signal } = this._abortController;
+    // Create stream state for parallel tracking
+    const abortController = new AbortController();
+    const streamState: StreamState = { abortController, fullResponse: '' };
+    this._streams.set(session.id, streamState);
 
     try {
       await streamOllama({
         model,
         messages: ollamaMessages,
-        signal,
+        signal: abortController.signal,
         onToken: (chunk) => {
-          fullResponse += chunk;
-          this._post({ type: 'streamToken', token: chunk });
+          streamState.fullResponse += chunk;
+          this._post({ type: 'streamToken', token: chunk, sessionId: session!.id });
         },
-        onDone: () => {
-          // Append the full assistant response and persist
-          session!.messages.push({ role: 'assistant', content: fullResponse });
-          this._sessions.saveSession(session!);
-          this._post({ type: 'streamEnd' });
-          // Push updated session so the webview has current message history
-          this._postActiveSession();
+        onDone: async () => {
+          session!.messages.push({ role: 'assistant', content: streamState.fullResponse, model });
+          session!.status = 'unread';
+          // If user is viewing this session, mark as read
+          if (this._sessions.getActiveId() === session!.id) {
+            session!.status = 'read';
+          }
+          await this._sessions.saveSession(session!);
+          this._streams.delete(session!.id);
+          this._post({ type: 'streamEnd', sessionId: session!.id });
+          this._postSessions();
+          await this._postActiveSession();
         },
       });
     } catch (err: unknown) {
-      if (signal.aborted) {
-        // User stopped generation — save whatever was generated so far
-        if (fullResponse) {
-          session!.messages.push({ role: 'assistant', content: fullResponse });
-          this._sessions.saveSession(session!);
+      if (abortController.signal.aborted) {
+        if (streamState.fullResponse) {
+          session!.messages.push({ role: 'assistant', content: streamState.fullResponse, model });
         }
-        this._post({ type: 'streamEnd' });
-        this._postActiveSession();
+        session!.status = 'read';
+        await this._sessions.saveSession(session!);
+        this._post({ type: 'streamEnd', sessionId: session!.id });
+        await this._postActiveSession();
       } else {
+        session!.status = 'read';
+        await this._sessions.saveSession(session!);
         const errorMsg = err instanceof Error ? err.message : String(err);
-        this._post({ type: 'streamError', error: errorMsg });
+        this._post({ type: 'streamError', error: errorMsg, sessionId: session!.id });
       }
-    } finally {
-      this._abortController = null;
+      this._streams.delete(session!.id);
+      this._postSessions();
     }
   }
 
-  /** Aborts the current streaming request. */
-  private _handleStopGeneration(): void {
-    if (this._abortController) {
-      this._abortController.abort();
+  /** Generates a title for a new session using the LLM (non-streaming). */
+  private async _generateTitle(session: Session, userMessage: string, model: string): Promise<void> {
+    try {
+      const { baseUrl } = getConfig();
+      const res = await fetch(`${baseUrl}/v1/chat/completions`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          model,
+          messages: [
+            { role: 'system', content: TITLE_GENERATOR_PROMPT },
+            { role: 'user', content: userMessage },
+          ],
+          stream: false,
+        }),
+      });
+      if (res.ok) {
+        const data = await res.json() as { choices?: Array<{ message?: { content?: string } }> };
+        const title = data.choices?.[0]?.message?.content?.trim();
+        if (title && title.length > 0) {
+          const truncated = title.length > 50 ? title.slice(0, 50) + '...' : title;
+          session.title = truncated;
+          await this._sessions.updateTitle(session.id, truncated);
+        }
+      }
+    } catch {
+      // Fallback: use truncated first message
+      await this._sessions.updateTitle(session.id, userMessage);
     }
   }
 
-  /**
-   * Handles editing and resending a previous user message.
-   * Truncates the session to the edited message index, then streams a new response.
-   */
-  private async _handleResend(
-    messageIndex: number,
-    text: string,
-    model: string,
-    attachments: Attachment[]
-  ): Promise<void> {
-    const session = this._sessions.getActive();
+  /** Stops generation for a specific session (or the active one). */
+  private _handleStopGeneration(sessionId?: string): void {
+    const id = sessionId ?? this._sessions.getActiveId();
+    if (id) {
+      const stream = this._streams.get(id);
+      if (stream) { stream.abortController.abort(); }
+    }
+  }
+
+  /** If the target session has an active stream, replay current content. */
+  private _replayStreamState(sessionId: string): void {
+    const stream = this._streams.get(sessionId);
+    if (stream) {
+      this._post({ type: 'streamStart', sessionId });
+      if (stream.fullResponse) {
+        this._post({ type: 'streamReplay', sessionId, content: stream.fullResponse });
+      }
+    }
+  }
+
+  /** Handles editing and resending a previous user message. */
+  private async _handleResend(messageIndex: number, text: string, model: string, attachments: Attachment[]): Promise<void> {
+    const session = await this._sessions.getActive();
     if (!session) { return; }
 
-    // Truncate: remove the edited message and everything after it
+    // Discard any compaction checkpoints past the edit point
+    // Keep only checkpoints where upTo <= messageIndex (those are still valid)
+    if (session.compactions && session.compactions.length > 0) {
+      session.compactions = session.compactions.filter(cp => cp.upTo <= messageIndex);
+      if (session.compactions.length === 0) { session.compactions = undefined; }
+    }
+
     session.messages = session.messages.slice(0, messageIndex);
-    this._sessions.saveSession(session);
-
-    // Re-render the chat area with truncated history
-    this._postActiveSession();
-
-    // Now handle as a new chat message (it will push user msg + stream response)
+    // Clear redo stack since user is sending new content
+    session.redoStack = undefined;
+    await this._sessions.saveSession(session);
+    await this._postActiveSession();
     await this._handleChat(text, model, attachments);
   }
 
-  // ── Model management ──────────────────────────────────────────────────
+  // ── Checkpoint / Fork ─────────────────────────────────────────────────
 
   /**
-   * Compacts the current session by summarizing all messages into a single
-   * system-style summary, replacing the message history. This reduces token
-   * usage while preserving context for continued conversation.
+   * Restores a checkpoint: truncates session to messageIndex, saves removed
+   * messages to redoStack so user can redo (replay without LLM call).
+   */
+  private async _handleRestoreCheckpoint(messageIndex: number): Promise<void> {
+    const session = await this._sessions.getActive();
+    if (!session) { return; }
+
+    // Save messages after the checkpoint to redo stack
+    const removed = session.messages.slice(messageIndex);
+    session.redoStack = removed;
+
+    // Truncate messages
+    session.messages = session.messages.slice(0, messageIndex);
+
+    // Trim compaction checkpoints past this point
+    if (session.compactions && session.compactions.length > 0) {
+      session.compactions = session.compactions.filter(cp => cp.upTo <= messageIndex);
+      if (session.compactions.length === 0) { session.compactions = undefined; }
+    }
+
+    await this._sessions.saveSession(session);
+    this._postSessions();
+    await this._postActiveSession();
+  }
+
+  /**
+   * Redo: replays messages from the redo stack back onto the session.
+   * No LLM call — just restores what was removed by checkpoint restore.
+   */
+  private async _handleRedo(): Promise<void> {
+    const session = await this._sessions.getActive();
+    if (!session || !session.redoStack || session.redoStack.length === 0) { return; }
+
+    // Push all redo messages back
+    session.messages.push(...session.redoStack);
+    session.redoStack = undefined;
+
+    await this._sessions.saveSession(session);
+    this._postSessions();
+    await this._postActiveSession();
+  }
+
+  /**
+   * Fork: creates a new session with messages up to messageIndex copied from current.
+   * The original session is unchanged.
+   */
+  private async _handleFork(messageIndex: number): Promise<void> {
+    const session = await this._sessions.getActive();
+    if (!session) { return; }
+
+    const forked = await this._sessions.createNew();
+    forked.title = session.title + ' (fork)';
+    forked.messages = session.messages.slice(0, messageIndex).map(m => ({ ...m }));
+
+    // Copy compaction checkpoints that are still valid for the forked range
+    if (session.compactions) {
+      forked.compactions = session.compactions.filter(cp => cp.upTo <= messageIndex).map(cp => ({ ...cp }));
+      if (forked.compactions.length === 0) { forked.compactions = undefined; }
+    }
+
+    await this._sessions.saveSession(forked);
+    this._postSessions();
+    await this._postActiveSession();
+  }
+
+  /**
+   * Stacking compaction: summarizes messages since the last checkpoint.
+   * Pushes a new CompactionCheckpoint. Original messages preserved for display.
+   * Multiple compactions stack — each covers its own range.
    */
   private async _handleCompactConversation(model: string): Promise<void> {
-    const session = this._sessions.getActive();
+    const session = await this._sessions.getActive();
     if (!session || session.messages.length < 2) { return; }
 
-    // Build a transcript of the conversation for the LLM to summarize
-    const transcript = session.messages.map(m => {
+    const checkpoints = session.compactions || [];
+    // Only compact messages after the last checkpoint
+    const lastUpTo = checkpoints.length > 0 ? checkpoints[checkpoints.length - 1].upTo : 0;
+    const messagesToCompact = session.messages.slice(lastUpTo);
+    if (messagesToCompact.length < 2) { return; }
+
+    // Include previous summaries as context for continuity
+    let contextPrefix = '';
+    if (checkpoints.length > 0) {
+      contextPrefix = 'Previous summaries:\n' + checkpoints.map(cp => cp.summary).join('\n---\n') + '\n\nNew messages to summarize:\n';
+    }
+
+    const transcript = messagesToCompact.map(m => {
       const role = m.role === 'user' ? 'User' : m.role === 'assistant' ? 'Assistant' : 'System';
       return `${role}: ${m.content}`;
     }).join('\n\n');
 
-    this._post({ type: 'streamStart' });
+    this._post({ type: 'streamStart', sessionId: session.id });
     this._post({ type: 'compactStart' });
-
     let summary = '';
 
     try {
@@ -458,29 +545,29 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
         model,
         messages: [
           { role: 'system', content: COMPACT_CONVERSATION_PROMPT },
-          { role: 'user', content: `Here is the conversation to summarize:\n\n${transcript}` },
+          { role: 'user', content: contextPrefix + transcript },
         ],
         onToken: (chunk) => {
           summary += chunk;
-          this._post({ type: 'streamToken', token: chunk });
+          this._post({ type: 'streamToken', token: chunk, sessionId: session.id });
         },
-        onDone: () => {
-          // Replace the session messages with a single summary + marker
-          session.messages = [
-            { role: 'assistant', content: `**[Conversation Compacted]**\n\n${summary}` },
-          ];
-          this._sessions.saveSession(session);
-          this._post({ type: 'streamEnd' });
-          this._postActiveSession();
+        onDone: async () => {
+          // Push new checkpoint
+          if (!session.compactions) { session.compactions = []; }
+          session.compactions.push({ upTo: session.messages.length, summary });
+          await this._sessions.saveSession(session);
+          this._post({ type: 'streamEnd', sessionId: session.id });
+          await this._postActiveSession();
         },
       });
     } catch (err: unknown) {
       const errorMsg = err instanceof Error ? err.message : String(err);
-      this._post({ type: 'streamError', error: errorMsg });
+      this._post({ type: 'streamError', error: errorMsg, sessionId: session.id });
     }
   }
 
-  /** Checks if Ollama is running and tells the webview. */
+  // ── Model management ──────────────────────────────────────────────────
+
   private async _handleCheckOllama(): Promise<void> {
     const online = await checkOllama();
     this._post({ type: 'ollamaStatus', online });
@@ -488,98 +575,63 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
 
   // ── Image persistence ─────────────────────────────────────────────────
 
-  /**
-   * Saves a base64 data URL image to the extension's persistent storage.
-   * Returns the relative path (from storageUri) for the saved file.
-   */
   private async _saveImage(dataUrl: string, fileName: string): Promise<string> {
-    // Ensure the images directory exists
     const imagesDir = vscode.Uri.joinPath(this._storageUri, 'images');
     try { await vscode.workspace.fs.createDirectory(imagesDir); } catch { /* exists */ }
-
-    // Generate a unique filename to avoid collisions
     const uniqueName = `${Date.now()}-${fileName.replace(/[^a-zA-Z0-9.-]/g, '_')}`;
     const fileUri = vscode.Uri.joinPath(imagesDir, uniqueName);
-
-    // Extract the base64 portion from the data URL
     const base64Match = dataUrl.match(/^data:[^;]+;base64,(.+)$/);
     if (base64Match) {
-      const buffer = Buffer.from(base64Match[1], 'base64');
-      await vscode.workspace.fs.writeFile(fileUri, buffer);
+      await vscode.workspace.fs.writeFile(fileUri, Buffer.from(base64Match[1], 'base64'));
     }
-
     return `images/${uniqueName}`;
   }
 
-  /**
-   * Resolves a stored image path to a webview-safe URI.
-   * Returns null if the webview isn't available.
-   */
   private _resolveImageUri(imagePath: string): string | null {
     if (!this._view) { return null; }
-    const fileUri = vscode.Uri.joinPath(this._storageUri, imagePath);
-    return this._view.webview.asWebviewUri(fileUri).toString();
+    return this._view.webview.asWebviewUri(vscode.Uri.joinPath(this._storageUri, imagePath)).toString();
   }
 
-  /**
-   * Deletes images older than 30 days from the persistent storage.
-   * Called once on extension activation via resolveWebviewView.
-   */
   public async cleanupOldImages(): Promise<void> {
     const imagesDir = vscode.Uri.joinPath(this._storageUri, 'images');
     const THIRTY_DAYS_MS = 30 * 24 * 60 * 60 * 1000;
     const cutoff = Date.now() - THIRTY_DAYS_MS;
-
     try {
       const entries = await vscode.workspace.fs.readDirectory(imagesDir);
       for (const [name, type] of entries) {
         if (type !== vscode.FileType.File) { continue; }
-        // Filename starts with a timestamp: "1712345678901-image.png"
         const tsMatch = name.match(/^(\d+)-/);
-        if (tsMatch) {
-          const fileTs = parseInt(tsMatch[1], 10);
-          if (fileTs < cutoff) {
-            const fileUri = vscode.Uri.joinPath(imagesDir, name);
-            await vscode.workspace.fs.delete(fileUri);
-          }
+        if (tsMatch && parseInt(tsMatch[1], 10) < cutoff) {
+          await vscode.workspace.fs.delete(vscode.Uri.joinPath(imagesDir, name));
         }
       }
-    } catch {
-      // Images directory might not exist yet — that's fine
-    }
+    } catch { /* dir might not exist */ }
   }
 
-  /** Fetches installed models from Ollama and sends the list to the webview. */
+  /** Fetches installed models + context sizes and sends to webview. */
   private async _handleGetModels(): Promise<void> {
     const installed = await listModels();
-    this._post({ type: 'models', installed });
+    const contextSizes: Record<string, number> = {};
+    await Promise.all(installed.map(async (id) => {
+      contextSizes[id] = await getModelContextSize(id);
+    }));
+    this._post({ type: 'models', installed, contextSizes });
   }
 
-  /**
-   * Pulls a model from the Ollama registry with a VS Code progress notification.
-   * After the pull completes, refreshes the model list.
-   */
   private async _handlePullModel(model: string): Promise<void> {
     this._post({ type: 'pullStart', model });
-
     try {
       await vscode.window.withProgress(
-        {
-          location: vscode.ProgressLocation.Notification,
-          title: `Downloading ${model}...`,
-          cancellable: false,
-        },
+        { location: vscode.ProgressLocation.Notification, title: `Downloading ${model}...`, cancellable: false },
         async (progress) => {
           let lastPct = 0;
           await pullModel(model, (pct) => {
-            // Report incremental progress
             progress.report({ increment: pct - lastPct, message: `${pct}%` });
             lastPct = pct;
             this._post({ type: 'pullProgress', model, progress: pct });
           });
         }
       );
-
       this._post({ type: 'pullDone', model });
       vscode.window.showInformationMessage(`Model ${model} downloaded successfully.`);
     } catch (err: unknown) {
@@ -587,59 +639,42 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
       this._post({ type: 'pullError', model, error: errorMsg });
       vscode.window.showErrorMessage(`Failed to download ${model}: ${errorMsg}`);
     }
-
-    // Refresh the installed models list
     await this._handleGetModels();
   }
 
-  /** Persists the selected model to VS Code settings. */
   private async _handleSelectModel(model: string): Promise<void> {
     await setModel(model);
   }
 
   // ── Editor context ────────────────────────────────────────────────────
 
-  /** Sends current editor file info + selection state to the webview. */
   private _sendEditorContext(): void {
     const editor = vscode.window.activeTextEditor;
     if (!editor) {
       this._post({ type: 'editorContext', fileName: null, hasSelection: false });
       return;
     }
-
     const doc = editor.document;
     const fileName = doc.fileName.split(/[\\/]/).pop() ?? doc.fileName;
     const selection = editor.selection;
     const hasSelection = !selection.isEmpty;
-    const selectionText = hasSelection ? doc.getText(selection) : undefined;
-    const selectionRange = hasSelection
-      ? `${selection.start.line + 1}-${selection.end.line + 1}`
-      : undefined;
-
     this._post({
       type: 'editorContext',
       fileName,
       hasSelection,
-      selectionText,
-      selectionRange,
+      selectionText: hasSelection ? doc.getText(selection) : undefined,
+      selectionRange: hasSelection ? `${selection.start.line + 1}-${selection.end.line + 1}` : undefined,
     });
   }
 
-  /** Reads the entire active editor file and sends it to the webview. */
   private async _handleAddCurrentFile(): Promise<void> {
     const editor = vscode.window.activeTextEditor;
     if (!editor) { return; }
     const doc = editor.document;
     const fileName = doc.fileName.split(/[\\/]/).pop() ?? doc.fileName;
-    const content = doc.getText();
-    this._post({
-      type: 'fileAdded',
-      name: fileName,
-      content,
-    });
+    this._post({ type: 'fileAdded', name: fileName, content: doc.getText() });
   }
 
-  /** Reads the current selection and sends it to the webview. */
   private _handleAddSelection(): void {
     const editor = vscode.window.activeTextEditor;
     if (!editor || editor.selection.isEmpty) { return; }
@@ -647,46 +682,25 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
     const fileName = doc.fileName.split(/[\\/]/).pop() ?? doc.fileName;
     const selection = editor.selection;
     const range = `${selection.start.line + 1}-${selection.end.line + 1}`;
-    const content = doc.getText(selection);
-    this._post({
-      type: 'selectionAdded',
-      name: `${fileName}:${range}`,
-      content,
-    });
+    this._post({ type: 'selectionAdded', name: `${fileName}:${range}`, content: doc.getText(selection) });
   }
 
-  /** Opens VS Code file picker and sends the selected file(s) to the webview. */
   private async _handleAttachFile(): Promise<void> {
-    const uris = await vscode.window.showOpenDialog({
-      canSelectMany: true,
-      canSelectFiles: true,
-      canSelectFolders: false,
-      openLabel: 'Attach',
-    });
+    const uris = await vscode.window.showOpenDialog({ canSelectMany: true, canSelectFiles: true, canSelectFolders: false, openLabel: 'Attach' });
     if (!uris || uris.length === 0) { return; }
-
     for (const uri of uris) {
       const fileName = uri.path.split('/').pop() ?? uri.path;
       try {
-        // Check if it's an image by extension
         const ext = fileName.split('.').pop()?.toLowerCase() ?? '';
         const imageExts = ['png', 'jpg', 'jpeg', 'gif', 'webp', 'bmp', 'svg'];
-
         if (imageExts.includes(ext)) {
           const bytes = await vscode.workspace.fs.readFile(uri);
           const base64 = Buffer.from(bytes).toString('base64');
-          const mimeType = ext === 'svg' ? 'image/svg+xml'
-            : ext === 'jpg' ? 'image/jpeg'
-            : `image/${ext}`;
-          this._post({
-            type: 'imageAdded',
-            name: fileName,
-            dataUrl: `data:${mimeType};base64,${base64}`,
-          });
+          const mimeType = ext === 'svg' ? 'image/svg+xml' : ext === 'jpg' ? 'image/jpeg' : `image/${ext}`;
+          this._post({ type: 'imageAdded', name: fileName, dataUrl: `data:${mimeType};base64,${base64}` });
         } else {
           const bytes = await vscode.workspace.fs.readFile(uri);
-          const content = Buffer.from(bytes).toString('utf8');
-          this._post({ type: 'fileAdded', name: fileName, content });
+          this._post({ type: 'fileAdded', name: fileName, content: Buffer.from(bytes).toString('utf8') });
         }
       } catch {
         this._post({ type: 'fileAdded', name: fileName, content: `(Failed to read ${fileName})` });
@@ -694,28 +708,19 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
     }
   }
 
-  /** Reads a file from a URI string (e.g. from a drop) and sends it to the webview. */
   private async _handleReadDroppedUri(uriStr: string, name: string): Promise<void> {
     try {
       const uri = vscode.Uri.parse(uriStr);
       const ext = name.split('.').pop()?.toLowerCase() ?? '';
       const imageExts = ['png', 'jpg', 'jpeg', 'gif', 'webp', 'bmp', 'svg'];
-
       if (imageExts.includes(ext)) {
         const bytes = await vscode.workspace.fs.readFile(uri);
         const base64 = Buffer.from(bytes).toString('base64');
-        const mimeType = ext === 'svg' ? 'image/svg+xml'
-          : ext === 'jpg' ? 'image/jpeg'
-          : `image/${ext}`;
-        this._post({
-          type: 'imageAdded',
-          name,
-          dataUrl: `data:${mimeType};base64,${base64}`,
-        });
+        const mimeType = ext === 'svg' ? 'image/svg+xml' : ext === 'jpg' ? 'image/jpeg' : `image/${ext}`;
+        this._post({ type: 'imageAdded', name, dataUrl: `data:${mimeType};base64,${base64}` });
       } else {
         const bytes = await vscode.workspace.fs.readFile(uri);
-        const content = Buffer.from(bytes).toString('utf8');
-        this._post({ type: 'fileAdded', name, content });
+        this._post({ type: 'fileAdded', name, content: Buffer.from(bytes).toString('utf8') });
       }
     } catch {
       this._post({ type: 'fileAdded', name, content: `(Failed to read ${name})` });

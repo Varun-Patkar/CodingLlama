@@ -17,8 +17,9 @@ export interface ModelEntry {
   contextSize: number;
 }
 
-/** The five default models always shown in the picker. */
+/** The default models always shown in the picker. */
 export const STATIC_MODELS: ModelEntry[] = [
+  { id: 'gemma4:e4b',           label: 'Gemma 4 E4B',          tier: 'high',   sizeGb: 9.6, contextSize: 131072 },
   { id: 'qwen2.5-coder:7b',    label: 'Qwen 2.5 Coder 7B',   tier: 'high',   sizeGb: 4.7, contextSize: 32768  },
   { id: 'qwen2.5-coder:3b',    label: 'Qwen 2.5 Coder 3B',   tier: 'medium', sizeGb: 1.9, contextSize: 32768  },
   { id: 'deepseek-coder:6.7b', label: 'DeepSeek Coder 6.7B',  tier: 'high',   sizeGb: 3.8, contextSize: 16384  },

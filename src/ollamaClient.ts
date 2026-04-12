@@ -117,6 +117,48 @@ export async function listModels(): Promise<string[]> {
 }
 
 /**
+ * Fetches model info from Ollama's /api/show endpoint.
+ * Returns the context window size in tokens.
+ * Checks both model_info (e.g. "qwen2.context_length") and parameters ("num_ctx").
+ * Falls back to 8192 if unable to determine.
+ */
+export async function getModelContextSize(model: string): Promise<number> {
+  const { baseUrl } = getConfig();
+  try {
+    const res = await fetch(`${baseUrl}/api/show`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name: model }),
+    });
+    if (!res.ok) { return 8192; }
+    const data = await res.json() as Record<string, unknown>;
+
+    // Check model_info for any key ending in "context_length"
+    const modelInfo = data.model_info as Record<string, unknown> | undefined;
+    if (modelInfo) {
+      for (const key of Object.keys(modelInfo)) {
+        if (key.endsWith('.context_length') || key === 'context_length') {
+          const val = Number(modelInfo[key]);
+          if (val > 0) { return val; }
+        }
+      }
+    }
+
+    // Check parameters string for num_ctx (custom modelfile override)
+    const params = String(data.parameters ?? '');
+    const numCtxMatch = params.match(/num_ctx\s+(\d+)/);
+    if (numCtxMatch) {
+      const val = Number(numCtxMatch[1]);
+      if (val > 0) { return val; }
+    }
+
+    return 8192;
+  } catch {
+    return 8192;
+  }
+}
+
+/**
  * Pulls (downloads) a model from the Ollama registry.
  * Uses the Ollama-native /api/pull endpoint with streaming NDJSON progress.
  *

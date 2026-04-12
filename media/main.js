@@ -21,15 +21,17 @@
   let state = vscode.getState() || {
     sessions: [],
     activeSession: null,
-    selectedModel: null,      // null = auto-select on first models list
+    selectedModel: null,
     installedModels: [],
-    isStreaming: false,
-    streamingContent: '',
     pullingModels: {},
     sessionsExpanded: true,
     activeMode: 'Ask',
-    attachments: [],           // [{ id, type:'file'|'image'|'selection', name, content?, dataUrl? }]
+    attachments: [],
+    sessionFilter: 'all',     // 'all' | 'streaming' | 'unread'
   };
+
+  // Per-session streaming state: { [sessionId]: { content, active } }
+  var streamingStates = {};
 
   // Editor context from the extension (current file + selection info)
   let editorContext = { fileName: null, hasSelection: false, selectionText: null, selectionRange: null };
@@ -37,13 +39,14 @@
   // System prompt token count (sent by extension on activeSession)
   let systemPromptTokens = 0;
 
-  // Track which dropup is open: null, 'mode', or 'model'
-  let openDropup = null;
+  // Dynamic context sizes fetched from Ollama (for non-static models)
+  var dynamicContextSizes = {};
 
   // Track whether we just finished streaming (to avoid double-render)
   let justFinishedStreaming = false;
 
-  // ── DOM references ─────────────────────────────────────────────────────
+  // Track which dropup is open: null, 'mode', or 'model'
+  let openDropup = null;
   let messagesContainer = null;
   let chatInput = null;
   let sendBtn = null;
@@ -105,38 +108,75 @@
         scrollToBottom();
         break;
 
-      case 'streamStart':
-        state.isStreaming = true;
-        state.streamingContent = '';
-        appendStreamingMessage();
+      case 'streamStart': {
+        var sid = msg.sessionId;
+        streamingStates[sid] = { content: '', active: true };
+        // Only show streaming UI if this is the active session
+        if (state.activeSession && state.activeSession.id === sid) {
+          appendStreamingMessage();
+        }
+        renderSessionsList(); // update status icon
         break;
+      }
 
-      case 'streamToken':
-        state.streamingContent += msg.token;
-        updateStreamingMessage();
-        scrollToBottom();
+      case 'streamToken': {
+        var sid2 = msg.sessionId;
+        if (streamingStates[sid2]) {
+          streamingStates[sid2].content += msg.token;
+        }
+        if (state.activeSession && state.activeSession.id === sid2) {
+          updateStreamingMessage(streamingStates[sid2]?.content || '');
+          scrollToBottom();
+        }
         break;
+      }
 
-      case 'streamEnd':
-        state.isStreaming = false;
-        justFinishedStreaming = true;
-        finaliseStreamingMessage();
-        enableInput();
-        scrollToBottom();
+      case 'streamReplay': {
+        // Replaying accumulated content when switching to a streaming session
+        var sid3 = msg.sessionId;
+        if (streamingStates[sid3]) {
+          streamingStates[sid3].content = msg.content;
+        }
+        if (state.activeSession && state.activeSession.id === sid3) {
+          appendStreamingMessage();
+          updateStreamingMessage(msg.content);
+          scrollToBottom();
+        }
         break;
+      }
 
-      case 'streamError':
-        state.isStreaming = false;
-        showStreamError(msg.error);
-        enableInput();
+      case 'streamEnd': {
+        var sid4 = msg.sessionId;
+        delete streamingStates[sid4];
+        if (state.activeSession && state.activeSession.id === sid4) {
+          justFinishedStreaming = true;
+          finaliseStreamingMessage();
+          enableInput();
+          scrollToBottom();
+        }
+        renderSessionsList();
         break;
+      }
+
+      case 'streamError': {
+        var sid5 = msg.sessionId;
+        delete streamingStates[sid5];
+        if (state.activeSession && state.activeSession.id === sid5) {
+          showStreamError(msg.error);
+          enableInput();
+        }
+        renderSessionsList();
+        break;
+      }
 
       case 'models':
         state.installedModels = msg.installed;
+        if (msg.contextSizes) { dynamicContextSizes = msg.contextSizes; }
         // Auto-select best installed model if none selected yet
         autoSelectModel();
         saveState();
         if (openDropup === 'model') { renderModelDropup(); }
+        updateTokenCounter();
         break;
 
       case 'pullStart':
@@ -328,6 +368,22 @@
     bar.appendChild(left);
 
     const actions = el('div', { className: 'top-bar-actions' });
+
+    // Filter dropdown
+    var filterSelect = el('select', { className: 'session-filter', id: 'session-filter', title: 'Filter sessions' });
+    [['all', 'All'], ['streaming', '⟳ Active'], ['unread', '● Unread']].forEach(function(opt) {
+      var o = el('option', { textContent: opt[1] });
+      o.value = opt[0];
+      if (state.sessionFilter === opt[0]) { o.selected = true; }
+      filterSelect.appendChild(o);
+    });
+    filterSelect.addEventListener('change', function() {
+      state.sessionFilter = filterSelect.value;
+      saveState();
+      renderSessionsList();
+    });
+    actions.appendChild(filterSelect);
+
     const newBtn = el('button', { className: 'icon-btn', title: 'New Chat', textContent: '+' });
     newBtn.addEventListener('click', () => vscode.postMessage({ type: 'newChat' }));
     actions.appendChild(newBtn);
@@ -368,16 +424,41 @@
 
     const sessions = state.sessions || [];
     const activeId = state.activeSession?.id;
+    const filter = state.sessionFilter || 'all';
 
-    if (sessions.length === 0) {
-      list.appendChild(el('div', { className: 'sessions-empty', textContent: 'No sessions yet' }));
+    // Apply filter
+    var filtered = sessions;
+    if (filter === 'streaming') {
+      filtered = sessions.filter(function(s) { return !!streamingStates[s.id]; });
+    } else if (filter === 'unread') {
+      filtered = sessions.filter(function(s) { return s.status === 'unread' || !!streamingStates[s.id]; });
+    }
+
+    if (filtered.length === 0) {
+      var emptyText = sessions.length === 0 ? 'No sessions yet' : 'No matching sessions';
+      list.appendChild(el('div', { className: 'sessions-empty', textContent: emptyText }));
       return;
     }
 
-    sessions.forEach((session) => {
+    filtered.forEach((session) => {
       const item = el('div', {
         className: 'session-item' + (session.id === activeId ? ' active' : ''),
       });
+
+      // Status icon
+      var isStreaming = !!streamingStates[session.id];
+      var statusIcon = '';
+      var statusClass = 'session-status';
+      if (isStreaming) {
+        statusIcon = '⟳';
+        statusClass += ' status-streaming';
+      } else if (session.status === 'unread') {
+        statusIcon = '●';
+        statusClass += ' status-unread';
+      }
+      if (statusIcon) {
+        item.appendChild(el('span', { className: statusClass, textContent: statusIcon }));
+      }
 
       item.appendChild(el('span', { className: 'session-title', textContent: session.title }));
       item.appendChild(el('span', { className: 'session-time', textContent: formatTime(session.createdAt) }));
@@ -427,67 +508,150 @@
     }
 
     session.messages.forEach((msg, idx) => {
-      messagesContainer.appendChild(createMessageEl(msg.role, msg.content, msg.attachments || null, idx));
+      messagesContainer.appendChild(createMessageEl(msg.role, msg.content, msg.attachments || null, idx, msg.model || null));
     });
+
+    // Redo button — shown when there's a redo stack
+    if (session.redoStack && session.redoStack.length > 0) {
+      var redoBar = el('div', { className: 'redo-bar' });
+      var redoBtn = el('button', { className: 'redo-btn', title: 'Redo — restore removed messages' });
+      redoBtn.textContent = 'Redo (' + session.redoStack.length + ' messages)';
+      redoBtn.addEventListener('click', function() {
+        vscode.postMessage({ type: 'redoMessages' });
+      });
+      redoBar.appendChild(redoBtn);
+      messagesContainer.appendChild(redoBar);
+    }
+
     scrollToBottom();
   }
 
-  function createMessageEl(role, content, attachments, messageIndex) {
-    const msg = el('div', { className: 'message message-' + role });
+  function createMessageEl(role, content, attachments, messageIndex, modelName) {
+    var wrapper = el('div', { className: 'message-wrapper' });
 
-    // Role label + edit button for user messages
-    const roleRow = el('div', { className: 'message-role-row' });
-    roleRow.appendChild(el('span', {
-      className: 'message-role',
-      textContent: role === 'user' ? 'You' : 'CodingLlama',
-    }));
-
-    // Edit button for user messages (only when not streaming)
-    if (role === 'user' && messageIndex !== undefined) {
-      const editBtn = el('button', { className: 'msg-edit-btn', title: 'Edit and resend' });
-      editBtn.textContent = '✏';
-      editBtn.addEventListener('click', () => {
-        if (state.isStreaming) { return; }
-        openEditMode(messageIndex, content, attachments);
+    // Checkpoint bar (before each message except index 0)
+    if (messageIndex > 0) {
+      var cpBar = el('div', { className: 'checkpoint-bar' });
+      var restoreBtn = el('button', { className: 'checkpoint-btn', title: 'Restore checkpoint — go back to this point' });
+      restoreBtn.textContent = 'Restore Checkpoint';
+      restoreBtn.addEventListener('click', function(e) {
+        e.stopPropagation();
+        vscode.postMessage({ type: 'restoreCheckpoint', messageIndex: messageIndex });
       });
-      roleRow.appendChild(editBtn);
+      cpBar.appendChild(restoreBtn);
+
+      var forkBtn = el('button', { className: 'checkpoint-btn', title: 'Fork conversation from this point' });
+      forkBtn.textContent = 'Fork';
+      forkBtn.addEventListener('click', function(e) {
+        e.stopPropagation();
+        vscode.postMessage({ type: 'forkConversation', messageIndex: messageIndex });
+      });
+      cpBar.appendChild(forkBtn);
+
+      wrapper.appendChild(cpBar);
     }
-    msg.appendChild(roleRow);
 
-    // Message content
-    const body = el('div', { className: 'message-content' });
+    if (role === 'user') {
+      wrapper.appendChild(createUserBubble(content, attachments, messageIndex));
+    } else {
+      wrapper.appendChild(createAssistantBubble(content, modelName));
+    }
+
+    return wrapper;
+  }
+
+  /** Creates a right-aligned user bubble. Clickable to edit inline. */
+  function createUserBubble(content, attachments, messageIndex) {
+    var bubble = el('div', { className: 'bubble-user' });
+    bubble.setAttribute('data-msg-index', messageIndex);
+
+    var body = el('div', { className: 'bubble-content' });
     body.innerHTML = renderMarkdown(content);
-    msg.appendChild(body);
+    bubble.appendChild(body);
 
-    // Attachment tags BELOW the message content
-    if (role === 'user' && attachments && attachments.length > 0) {
-      const attBar = el('div', { className: 'msg-attachments' });
+    // Attachment pills below content
+    if (attachments && attachments.length > 0) {
+      var attBar = el('div', { className: 'msg-attachments' });
       attachments.forEach(function(att) {
-        const tag = el('span', { className: 'msg-attachment-tag' });
-        // Show image thumbnail from dataUrl (live) or imageUri (persisted)
+        var tag = el('span', { className: 'msg-attachment-tag' });
         var imgSrc = att.dataUrl || att.imageUri;
         if (att.type === 'image' && imgSrc) {
-          const thumb = document.createElement('img');
+          var thumb = document.createElement('img');
           thumb.className = 'msg-attachment-thumb';
           thumb.src = imgSrc;
-          thumb.addEventListener('click', function(e) {
-            e.stopPropagation();
-            openImageModal(imgSrc);
-          });
+          thumb.addEventListener('click', function(e) { e.stopPropagation(); openImageModal(imgSrc); });
           tag.appendChild(thumb);
         } else if (att.type === 'image') {
           tag.appendChild(el('span', { className: 'tag-icon', textContent: '🖼' }));
         } else {
-          const icon = att.type === 'selection' ? '✂' : '📄';
-          tag.appendChild(el('span', { className: 'tag-icon', textContent: icon }));
+          tag.appendChild(el('span', { className: 'tag-icon', textContent: att.type === 'selection' ? '✂' : '📄' }));
         }
         tag.appendChild(document.createTextNode(att.name));
         attBar.appendChild(tag);
       });
-      msg.appendChild(attBar);
+      bubble.appendChild(attBar);
     }
 
-    return msg;
+    // Click to enter edit mode
+    bubble.addEventListener('click', function(e) {
+      if (e.target.tagName === 'IMG' || e.target.tagName === 'BUTTON') { return; }
+      if (bubble.classList.contains('editing')) { return; }
+      openBubbleEdit(bubble, messageIndex, content, attachments);
+    });
+
+    return bubble;
+  }
+
+  /** Creates a left-aligned assistant bubble with action bar + model badge. */
+  function createAssistantBubble(content, modelName) {
+    var bubble = el('div', { className: 'bubble-assistant' });
+
+    var body = el('div', { className: 'bubble-content' });
+    body.innerHTML = renderMarkdown(content);
+    bubble.appendChild(body);
+
+    // Action bar: copy + regenerate + model badge
+    var actions = el('div', { className: 'bubble-actions' });
+
+    var copyBtn = el('button', { className: 'bubble-action-btn', title: 'Copy response' });
+    copyBtn.textContent = '📋';
+    copyBtn.addEventListener('click', function() {
+      navigator.clipboard.writeText(content).then(function() {
+        copyBtn.textContent = '✓';
+        setTimeout(function() { copyBtn.textContent = '📋'; }, 1500);
+      });
+    });
+    actions.appendChild(copyBtn);
+
+    // Hide regenerate while this session is streaming
+    if (!isActiveSessionStreaming()) {
+      var regenBtn = el('button', { className: 'bubble-action-btn', title: 'Regenerate response' });
+      regenBtn.textContent = '🔄';
+      regenBtn.addEventListener('click', function() {
+        if (!state.activeSession) { return; }
+        var msgs = state.activeSession.messages;
+        for (var i = msgs.length - 1; i >= 0; i--) {
+          if (msgs[i].role === 'user') {
+            vscode.postMessage({
+              type: 'resend',
+              messageIndex: i,
+              text: msgs[i].content,
+              model: state.selectedModel,
+              attachments: [],
+            });
+            break;
+          }
+        }
+      });
+      actions.appendChild(regenBtn);
+    }
+
+    if (modelName) {
+      actions.appendChild(el('span', { className: 'bubble-model-badge', textContent: modelName }));
+    }
+
+    bubble.appendChild(actions);
+    return bubble;
   }
 
   function appendStreamingMessage() {
@@ -495,29 +659,26 @@
     const empty = messagesContainer.querySelector('.chat-empty');
     if (empty) { empty.remove(); }
 
-    const msg = el('div', { className: 'message message-assistant', id: 'streaming-msg' });
-    msg.appendChild(el('div', { className: 'message-role', textContent: 'CodingLlama' }));
-    msg.appendChild(el('div', { className: 'message-content streaming-cursor', id: 'streaming-content' }));
+    const msg = el('div', { className: 'bubble-assistant', id: 'streaming-msg' });
+    msg.appendChild(el('div', { className: 'bubble-content streaming-cursor', id: 'streaming-content' }));
     messagesContainer.appendChild(msg);
     disableInput();
     scrollToBottom();
   }
 
-  function updateStreamingMessage() {
+  function updateStreamingMessage(content) {
     const body = document.getElementById('streaming-content');
-    if (body) { body.innerHTML = renderMarkdown(state.streamingContent); }
+    if (body) { body.innerHTML = renderMarkdown(content || ''); }
   }
 
   function finaliseStreamingMessage() {
     const body = document.getElementById('streaming-content');
     if (body) {
       body.classList.remove('streaming-cursor');
-      body.innerHTML = renderMarkdown(state.streamingContent);
       body.removeAttribute('id');
     }
     const msg = document.getElementById('streaming-msg');
     if (msg) { msg.removeAttribute('id'); }
-    state.streamingContent = '';
     saveState();
   }
 
@@ -645,7 +806,7 @@
     stopBtn.textContent = '■';
     stopBtn.style.display = 'none';
     stopBtn.addEventListener('click', () => {
-      vscode.postMessage({ type: 'stopGeneration' });
+      vscode.postMessage({ type: 'stopGeneration', sessionId: state.activeSession ? state.activeSession.id : null });
     });
     right.appendChild(stopBtn);
     right.appendChild(sendBtn);
@@ -658,8 +819,39 @@
 
   function getSelectedModelLabel() {
     if (!state.selectedModel) { return 'Select model'; }
-    const m = STATIC_MODELS.find((m) => m.id === state.selectedModel);
-    return m ? m.label : state.selectedModel;
+    var m = STATIC_MODELS.find(function(m) { return m.id === state.selectedModel; });
+    return m ? m.label : formatModelName(state.selectedModel);
+  }
+
+  /**
+   * Converts a raw model ID like "qwen3:8b" or "llama3.1-8b-32k:latest"
+   * into "Qwen 3 8B (qwen3:8b)" or "Llama 3.1 8B 32K (llama3.1-8b-32k)".
+   */
+  function formatModelName(modelId) {
+    // Split into name and tag
+    var parts = modelId.split(':');
+    var name = parts[0];
+    var tag = parts.length > 1 ? parts.slice(1).join(':') : '';
+
+    // Convert name: replace - and . with space, capitalize each word, uppercase size tokens
+    var formatted = name
+      .replace(/[-_.]/g, ' ')
+      .replace(/\b(\d+(\.\d+)?)(b|k|m)\b/gi, function(_, num, dec, suffix) {
+        return num + suffix.toUpperCase();
+      })
+      .split(' ')
+      .map(function(word) {
+        // Don't capitalize pure size tokens like "8B", "32K"
+        if (/^\d/.test(word)) { return word; }
+        return word.charAt(0).toUpperCase() + word.slice(1);
+      })
+      .join(' ');
+
+    // Add tag in parentheses if it's not "latest"
+    if (tag && tag !== 'latest') {
+      return formatted + ' (' + modelId + ')';
+    }
+    return formatted + ' (' + name + ')';
   }
 
   function updateModelButton() {
@@ -671,7 +863,7 @@
     chatInput = document.getElementById('chat-input');
     if (!chatInput) { return; }
     const text = chatInput.value.trim();
-    if (!text || state.isStreaming) { return; }
+    if (!text || isActiveSessionStreaming()) { return; }
 
     if (!state.selectedModel) {
       showStreamError('No model selected. Open the model picker and select or download one.');
@@ -728,6 +920,12 @@
     updateTokenCounter();
   }
 
+  /** Returns true if the currently viewed session has an active stream. */
+  function isActiveSessionStreaming() {
+    if (!state.activeSession) { return false; }
+    return !!streamingStates[state.activeSession.id];
+  }
+
   function disableInput() {
     const btn = document.getElementById('send-btn');
     const stop = document.getElementById('stop-btn');
@@ -756,8 +954,13 @@
 
   /** Gets the context window size for the selected model. */
   function getContextSize() {
-    const m = STATIC_MODELS.find(function(m) { return m.id === state.selectedModel; });
-    return m ? m.contextSize : 8192; // fallback for unknown models
+    var m = STATIC_MODELS.find(function(m) { return m.id === state.selectedModel; });
+    if (m) { return m.contextSize; }
+    // Use dynamic context size from Ollama /api/show
+    if (state.selectedModel && dynamicContextSizes[state.selectedModel]) {
+      return dynamicContextSizes[state.selectedModel];
+    }
+    return 8192; // fallback
   }
 
   /** Computes a full token breakdown for the current input state. */
@@ -921,11 +1124,11 @@
       tooltip.appendChild(el('div', { className: 'token-tooltip-sep' }));
       var hasMessages = b.historyTokens > 0;
       var compactBtn = el('button', {
-        className: 'compact-btn' + (hasMessages && !state.isStreaming ? '' : ' compact-btn-disabled'),
+        className: 'compact-btn' + (hasMessages && !isActiveSessionStreaming() ? '' : ' compact-btn-disabled'),
         textContent: '📦 Compact conversation',
         title: hasMessages ? 'Summarize conversation to save tokens' : 'Send at least 1 message first',
       });
-      if (hasMessages && !state.isStreaming) {
+      if (hasMessages && !isActiveSessionStreaming()) {
         compactBtn.addEventListener('click', function() {
           vscode.postMessage({ type: 'compactConversation', model: state.selectedModel });
         });
@@ -1104,115 +1307,154 @@
   // ── Edit & Resend ──────────────────────────────────────────────────────
 
   /**
-   * Opens inline edit mode for a previously sent user message.
-   * Replaces the message div with an editable textarea + attachment pills + resend button.
+   * Opens inline edit mode inside a user bubble.
+   * The bubble content is replaced with a textarea. The assistant response
+   * below gets greyed out. Click outside or Esc cancels editing.
    */
-  function openEditMode(messageIndex, originalText, originalAttachments) {
-    if (!messagesContainer) { return; }
+  function openBubbleEdit(bubble, messageIndex, originalText, originalAttachments) {
+    bubble.classList.add('editing');
+    var editAttachments = originalAttachments ? originalAttachments.slice() : [];
 
-    // Find the message element (it's at position messageIndex among the children,
-    // but we need to account for possible empty-state divs being removed)
-    const msgElements = messagesContainer.querySelectorAll('.message');
-    const msgEl = msgElements[messageIndex];
-    if (!msgEl) { return; }
+    // Save original HTML to restore on cancel
+    var originalHTML = bubble.innerHTML;
 
-    // Track edit-mode attachments separately
-    let editAttachments = originalAttachments ? originalAttachments.slice() : [];
+    // Grey out the next sibling (assistant response) if present
+    var nextSibling = bubble.nextElementSibling;
+    if (nextSibling && nextSibling.classList.contains('bubble-assistant')) {
+      nextSibling.classList.add('bubble-greyed');
+    }
 
-    // Replace the message with an edit form
-    const editForm = el('div', { className: 'message message-user message-editing' });
+    // Replace content with textarea
+    bubble.innerHTML = '';
 
-    editForm.appendChild(el('div', { className: 'message-role', textContent: 'You (editing)' }));
-
-    // Editable textarea
-    const textarea = el('textarea', { className: 'edit-textarea' });
+    var textarea = el('textarea', { className: 'bubble-edit-textarea' });
     textarea.value = originalText;
-    editForm.appendChild(textarea);
+    bubble.appendChild(textarea);
 
-    // Attachments area (editable — can remove)
-    const attArea = el('div', { className: 'edit-attachments', id: 'edit-att-' + messageIndex });
-    editForm.appendChild(attArea);
+    // Auto-fit height to content (no scroll, no manual resize)
+    function autoResize() {
+      textarea.style.height = 'auto';
+      textarea.style.height = textarea.scrollHeight + 'px';
+    }
+    textarea.addEventListener('input', autoResize);
+    // Initial fit after DOM insertion
+    setTimeout(autoResize, 0);
 
-    function renderEditAttachments() {
+    // Editable attachments
+    var attArea = el('div', { className: 'bubble-edit-attachments' });
+    bubble.appendChild(attArea);
+
+    function renderEditAtts() {
       attArea.innerHTML = '';
       editAttachments.forEach(function(att, i) {
-        const pill = el('div', { className: 'attachment-pill' + (att.type === 'image' ? ' attachment-pill-image' : '') });
-        if (att.type === 'image' && att.dataUrl) {
-          const thumb = document.createElement('img');
+        var pill = el('div', { className: 'attachment-pill' + (att.type === 'image' ? ' attachment-pill-image' : '') });
+        if (att.type === 'image' && (att.dataUrl || att.imageUri)) {
+          var thumb = document.createElement('img');
           thumb.className = 'pill-thumb';
-          thumb.src = att.dataUrl;
+          thumb.src = att.dataUrl || att.imageUri;
           pill.appendChild(thumb);
         } else {
-          const icon = att.type === 'selection' ? '✂' : '📄';
-          pill.appendChild(el('span', { className: 'pill-icon', textContent: icon }));
+          pill.appendChild(el('span', { className: 'pill-icon', textContent: att.type === 'selection' ? '✂' : att.type === 'image' ? '🖼' : '📄' }));
         }
         pill.appendChild(el('span', { className: 'pill-name', textContent: att.name }));
-        const removeBtn = el('button', { className: 'pill-remove', title: 'Remove', textContent: '×' });
-        removeBtn.addEventListener('click', function() {
-          editAttachments.splice(i, 1);
-          renderEditAttachments();
-        });
-        pill.appendChild(removeBtn);
+        var rmBtn = el('button', { className: 'pill-remove', title: 'Remove', textContent: '×' });
+        rmBtn.addEventListener('click', function(e) { e.stopPropagation(); editAttachments.splice(i, 1); renderEditAtts(); });
+        pill.appendChild(rmBtn);
         attArea.appendChild(pill);
       });
-
-      // "+ Add file" button
-      const addBtn = el('button', { className: 'add-context-btn' });
+      var addBtn = el('button', { className: 'add-context-btn' });
       addBtn.appendChild(el('span', { className: 'plus', textContent: '+' }));
-      addBtn.appendChild(document.createTextNode(' Add file'));
-      addBtn.addEventListener('click', function() {
+      addBtn.appendChild(document.createTextNode(' Add'));
+      addBtn.addEventListener('click', function(e) {
+        e.stopPropagation();
         vscode.postMessage({ type: 'attachFile' });
-        // Listen for the file response — we'll handle it via a one-time listener
-        const handler = function(event) {
-          const msg = event.data;
-          if (msg.type === 'fileAdded') {
-            editAttachments.push({ type: 'file', name: msg.name, content: msg.content });
-            renderEditAttachments();
-            window.removeEventListener('message', handler);
-          } else if (msg.type === 'imageAdded') {
-            editAttachments.push({ type: 'image', name: msg.name, dataUrl: msg.dataUrl });
-            renderEditAttachments();
-            window.removeEventListener('message', handler);
-          }
+        var handler = function(ev) {
+          var m = ev.data;
+          if (m.type === 'fileAdded') { editAttachments.push({ type: 'file', name: m.name, content: m.content }); renderEditAtts(); window.removeEventListener('message', handler); }
+          else if (m.type === 'imageAdded') { editAttachments.push({ type: 'image', name: m.name, dataUrl: m.dataUrl }); renderEditAtts(); window.removeEventListener('message', handler); }
         };
         window.addEventListener('message', handler);
       });
       attArea.appendChild(addBtn);
     }
+    renderEditAtts();
 
-    renderEditAttachments();
-
-    // Action buttons row
-    const actions = el('div', { className: 'edit-actions' });
-    const cancelBtn = el('button', { className: 'edit-cancel-btn', textContent: 'Cancel' });
-    cancelBtn.addEventListener('click', function() {
-      // Restore original message
-      editForm.replaceWith(createMessageEl('user', originalText, originalAttachments, messageIndex));
-    });
+    // Action buttons
+    var actions = el('div', { className: 'bubble-edit-actions' });
+    var cancelBtn = el('button', { className: 'bubble-edit-cancel', textContent: 'Cancel' });
+    cancelBtn.addEventListener('click', function(e) { e.stopPropagation(); closeBubbleEdit(bubble, originalHTML, nextSibling); });
     actions.appendChild(cancelBtn);
 
-    const resendBtn = el('button', { className: 'edit-resend-btn', textContent: 'Resend' });
-    resendBtn.addEventListener('click', function() {
-      const newText = textarea.value.trim();
+    var submitBtn = el('button', { className: 'bubble-edit-submit', textContent: 'Submit' });
+    submitBtn.addEventListener('click', function(e) {
+      e.stopPropagation();
+      var newText = textarea.value.trim();
       if (!newText) { return; }
+      // If streaming this session, stop it first
+      if (isActiveSessionStreaming() && state.activeSession) {
+        vscode.postMessage({ type: 'stopGeneration', sessionId: state.activeSession.id });
+      }
       vscode.postMessage({
         type: 'resend',
         messageIndex: messageIndex,
         text: newText,
         model: state.selectedModel,
-        attachments: editAttachments.map(function(a) {
-          return { type: a.type, name: a.name, content: a.content, dataUrl: a.dataUrl };
-        }),
+        attachments: editAttachments.map(function(a) { return { type: a.type, name: a.name, content: a.content, dataUrl: a.dataUrl }; }),
       });
     });
-    actions.appendChild(resendBtn);
+    actions.appendChild(submitBtn);
+    bubble.appendChild(actions);
 
-    editForm.appendChild(actions);
-    msgEl.replaceWith(editForm);
-
-    // Focus the textarea
+    // Focus textarea
     textarea.focus();
     textarea.selectionStart = textarea.value.length;
+
+    // Enter = submit, Shift+Enter = newline, Escape = cancel
+    textarea.addEventListener('keydown', function(e) {
+      if (e.key === 'Enter' && !e.shiftKey) {
+        e.preventDefault();
+        submitBtn.click();
+      } else if (e.key === 'Escape') {
+        e.preventDefault();
+        closeBubbleEdit(bubble, originalHTML, nextSibling);
+      }
+    });
+
+    // Click outside cancels
+    var outsideHandler = function(e) {
+      if (!bubble.contains(e.target)) {
+        closeBubbleEdit(bubble, originalHTML, nextSibling);
+        document.removeEventListener('mousedown', outsideHandler);
+      }
+    };
+    // Delay to avoid catching the click that opened edit mode
+    setTimeout(function() { document.addEventListener('mousedown', outsideHandler); }, 50);
+
+    // Store handler ref so closeBubbleEdit can remove it
+    bubble._outsideHandler = outsideHandler;
+  }
+
+  /** Restores a user bubble from edit mode to its original state. */
+  function closeBubbleEdit(bubble, originalHTML, greyedSibling) {
+    bubble.classList.remove('editing');
+    bubble.innerHTML = originalHTML;
+    if (greyedSibling) { greyedSibling.classList.remove('bubble-greyed'); }
+    if (bubble._outsideHandler) {
+      document.removeEventListener('mousedown', bubble._outsideHandler);
+      delete bubble._outsideHandler;
+    }
+    // Re-attach click handler (since innerHTML was restored)
+    var idx = parseInt(bubble.getAttribute('data-msg-index') || '0');
+    bubble.addEventListener('click', function handler(e) {
+      if (e.target.tagName === 'IMG' || e.target.tagName === 'BUTTON') { return; }
+      if (bubble.classList.contains('editing')) { return; }
+      var session = state.activeSession;
+      if (!session) { return; }
+      var msg = session.messages[idx];
+      if (msg && msg.role === 'user') {
+        openBubbleEdit(bubble, idx, msg.content, msg.attachments);
+      }
+    });
   }
 
   // ── Dropup menus ───────────────────────────────────────────────────────
@@ -1367,7 +1609,16 @@
         const item = el('div', {
           className: 'dropup-item' + (isSelected ? ' selected' : ''),
         });
-        item.appendChild(el('span', { className: 'dropup-item-name', textContent: modelId }));
+        // Format: "Nice Name (tag)" e.g. "Qwen 3 8B (qwen3:8b)"
+        var displayName = formatModelName(modelId);
+        item.appendChild(el('span', { className: 'dropup-item-name', textContent: displayName }));
+
+        // Show context size if known
+        var ctxSize = dynamicContextSizes[modelId];
+        if (ctxSize) {
+          item.appendChild(el('span', { className: 'dropup-item-right', textContent: formatTokenCount(ctxSize) + ' ctx' }));
+        }
+
         item.style.cursor = 'pointer';
         item.addEventListener('click', () => {
           state.selectedModel = modelId;
