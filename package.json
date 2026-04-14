@@ -4,6 +4,11 @@
   "description": "A local AI coding assistant powered by Ollama models",
   "version": "0.1.0",
   "publisher": "coding-llama",
+  "icon": "media/logo.png",
+  "galleryBanner": {
+    "color": "#0a0a0a",
+    "theme": "dark"
+  },
   "engines": {
     "vscode": "^1.85.0"
   },
